@@ -1,0 +1,26 @@
+# ---- data (large, not source) ----
+standrad-live-2d/
+Live2d-model-master.zip
+*.moc3
+*.model3.json
+*.motion3.json
+*.physics3.json
+*.cubism
+
+# ---- python env / caches ----
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ---- large research artifacts / caches ----
+outputs/
+*.npz
+
+# ---- tooling internals ----
+.workbuddy/
+
+# ---- misc ----
+.DS_Store
+*.swp
+sp.log
