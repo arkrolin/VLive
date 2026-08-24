@@ -36,6 +36,7 @@ import orjson
 sys.path.insert(0, str(Path(__file__).parent))
 from classify_hetero import classify  # noqa: E402
 from survey_parts import norm_part  # noqa: E402
+from exclusion_tables import build_exclusion_set  # noqa: E402
 
 PART_RE = re.compile(rb"PARTS?[_A-Za-z0-9]{1,60}")
 DROP_BUCKETS = {"fx", "macro", "prop"}
@@ -116,12 +117,23 @@ def main() -> None:
         if not vary:
             continue
         outs = physics_outputs(mdir)
+        ex = build_exclusion_set(mdir, vary)
+        blink_set = ex["blink"]
+        lip_set = ex["lipsync"]
         n_sem, n_part, sample = part_semantics(mdir)
         sem_ratio = n_sem / n_part if n_part else 0.0
 
         after_phys = [p for p in vary if p not in outs]
         target, dropped = [], []
         for p in after_phys:
+            if p in blink_set:
+                dropped.append(p)
+                dropped_by_bucket["blink"] += 1
+                continue
+            if p in lip_set:
+                dropped.append(p)
+                dropped_by_bucket["lipsync"] += 1
+                continue
             bucket, group = classify(p)
             if bucket in DROP_BUCKETS:
                 dropped.append(p)
@@ -162,6 +174,8 @@ def main() -> None:
                 "const": sorted(rec["param"]["const"].keys()),
                 "switch": sorted(rec["param"]["switch"].keys()),
                 "physics_out": sorted(p for p in vary if p in outs),
+                "blink": sorted(blink_set),
+                "lipsync": sorted(lip_set),
                 "nonmotion": sorted(dropped),
             },
             "needs_probe": sorted(p for p in target if classify(p)[0] == "tail"),
