@@ -67,7 +67,7 @@ def _adaln(cond, scale_shift):
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, d, n_heads, mlp_ratio):
+    def __init__(self, d, n_heads, mlp_ratio, dropout=0.0):
         super().__init__()
         self.norm1 = RMSNorm(d)
         self.qk = QKNorm(d)
@@ -79,6 +79,12 @@ class TemporalBlock(nn.Module):
             nn.Linear(d, d * mlp_ratio), nn.SiLU(),
             nn.Linear(d * mlp_ratio, d * mlp_ratio), nn.SiLU(),
             nn.Linear(d * mlp_ratio, d))
+        # zero-init AdaLN so the block is identity at init (stable DiT start)
+        nn.init.zeros_(self.ad1.weight)
+        nn.init.zeros_(self.ad1.bias)
+        nn.init.zeros_(self.ad2.weight)
+        nn.init.zeros_(self.ad2.bias)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x, cond):
         # x: (Bn, T, d); cond: (Bn, d)
@@ -87,18 +93,19 @@ class TemporalBlock(nn.Module):
         att, _ = self.attn(q, k, a)
         x = x + att
         m = _adaln(self.norm2(x), self.ad2(cond))
-        x = x + self.mlp(m)
+        x = x + self.drop(self.mlp(m))
         return x
 
 
 class TokenMixBlock(nn.Module):
-    def __init__(self, d, n_heads):
+    def __init__(self, d, n_heads, dropout=0.0):
         super().__init__()
         self.norm1 = RMSNorm(d)
         self.qk = QKNorm(d)
         self.attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
         self.norm2 = RMSNorm(d)
         self.mlp = nn.Sequential(nn.Linear(d, d * 4), nn.SiLU(), nn.Linear(d * 4, d))
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x, mask):
         # x: (Bt, n, d); mask: (Bt, n) 1=active
@@ -106,7 +113,7 @@ class TokenMixBlock(nn.Module):
         q, k = self.qk(a, a)
         att, _ = self.attn(q, k, a)
         x = x + att
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop(self.mlp(self.norm2(x)))
         return x * mask.unsqueeze(-1)
 
 
@@ -124,12 +131,16 @@ class Live2DModel(nn.Module):
         self.deformer = nn.Parameter(torch.zeros(d))
         self.action_emb = nn.Embedding(action_vocab_size, d)
         self.time_emb = TimestepEmbed(d)
-        self.in_proj = nn.Linear(1, d)
+        self.in_proj = nn.Linear(2, d)   # x_t channel + in-corpus exem channel
         self.temporal = nn.ModuleList(
-            [TemporalBlock(d, cfg.n_heads, cfg.mlp_ratio) for _ in range(cfg.n_layers)])
+            [TemporalBlock(d, cfg.n_heads, cfg.mlp_ratio, cfg.dropout)
+             for _ in range(cfg.n_layers)])
         self.tok_mix = nn.ModuleList(
-            [TokenMixBlock(d, cfg.n_heads) for _ in range(cfg.n_layers)])
+            [TokenMixBlock(d, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_layers)])
         self.head = nn.Linear(d, 1)
+        # zero-init head: x0_hat = exem (the prior) at init -> loss starts at floor
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
     def _token_emb(self, names, rig, action_id, training):
         B = len(names)
@@ -150,14 +161,14 @@ class Live2DModel(nn.Module):
         tok = tok + rig_e + act_e + self.deformer
         return tok  # (B, n_pad, d)
 
-    def forward(self, x_t, t, names, rig, action_id, token_mask, training=True):
+    def forward(self, x_t, t, names, rig, action_id, token_mask, exem, training=True):
         B, n, T = x_t.shape
         d = self.cfg.d_model
         tok = self._token_emb(names, rig, action_id, training)        # (B,n,d)
         t_e = self.time_emb(t).unsqueeze(1)                           # (B,1,d)
         cond = (tok + t_e).reshape(B * n, 1, d)                      # (Bn, 1, d)
 
-        h = self.in_proj(x_t.unsqueeze(-1))                           # (B,n,T,d)
+        h = self.in_proj(torch.cat([x_t.unsqueeze(-1), exem.unsqueeze(-1)], -1))  # (B,n,T,d)
         # temporal over T
         h = h.reshape(B * n, T, d)
         for blk in self.temporal:
@@ -170,10 +181,20 @@ class Live2DModel(nn.Module):
             h = blk(h, m)
         h = h.reshape(B, T, n, d).permute(0, 2, 1, 3)                # (B,n,T,d)
         out = self.head(h).squeeze(-1)                               # (B,n,T)
+        out = exem + out                                            # x0_hat = prior(exem) + residual
         return out * token_mask.unsqueeze(-1)
 
     # --------------------------- DDPM --------------------------- #
-    def ddpm_schedule(self, steps):
+    def ddpm_schedule(self, steps, cosine: bool = False):
+        if cosine:
+            # Nichol & Dhariwal cosine schedule (lower loss floor, smoother).
+            s = 0.008
+            x = torch.linspace(0.0, 1.0, steps + 1)
+            f = torch.cos((x + s) / (1.0 + s) * math.pi / 2.0) ** 2
+            alphabar = f / f[0]
+            betas = torch.clamp(1.0 - alphabar[1:] / alphabar[:-1], 1e-5, 0.999)
+            alphas = 1.0 - betas
+            return betas, alphas, alphabar[1:]
         betas = torch.linspace(1e-4, 2e-2, steps)
         alphas = 1 - betas
         alphabar = torch.cumprod(alphas, 0)

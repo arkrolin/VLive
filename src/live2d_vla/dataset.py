@@ -9,6 +9,8 @@ Each sample = one (target model, action) pair:
 """
 from __future__ import annotations
 
+import pickle
+import random
 import sys
 from pathlib import Path
 
@@ -30,7 +32,10 @@ def _build_action_vocab(samples):
 
 
 class Live2DDataset(Dataset):
-    def __init__(self, cfg, action_vocab=None):
+    def __init__(self, cfg, action_vocab=None, split: str = None):
+        """split: None (all) | "train" | "val". Vocab is always built over the
+        full subset so train/val share embeddings; samples are then filtered by
+        a deterministic whole-model holdout (val_frac of models)."""
         self.cfg = cfg
         whitelist = load_whitelist(cfg)
         gen_mask = load_gen_mask(cfg)
@@ -40,52 +45,50 @@ class Live2DDataset(Dataset):
         # param vocabulary (name -> idx) over the subset
         self.param2idx, self.word2idx = build_vocab(self.targets, cap=2048)
 
-        # samples = (model, action) with at least one motion
+        # all (model, action) samples (used to build a consistent action vocab)
         from io_motion import list_motions
 
-        self.samples = []
+        all_samples = []
         for m in self.subset:
             if m not in self.targets:
                 continue
             for action in list_motions(ROOT / cfg.data_root / m):
-                self.samples.append((m, action))
-        self.action2idx, _ = _build_action_vocab(self.samples) if action_vocab is None \
+                all_samples.append((m, action))
+        self.action2idx, _ = _build_action_vocab(all_samples) if action_vocab is None \
             else (action_vocab, list(action_vocab))
 
-        # B1 retriever (lazy, cached per (model,action))
-        from deploy.rig_retrieval import CorpusIndex, Retriever
+        # deterministic whole-model holdout
+        if cfg.val_frac and cfg.val_frac > 0:
+            rng = random.Random(cfg.seed)
+            n_val = max(1, int(round(len(self.subset) * cfg.val_frac)))
+            self.holdout = set(rng.sample(self.subset, n_val))
+        else:
+            self.holdout = set()
 
-        idx = CorpusIndex.load(str(cfg.retrieval_index))
-        self.retriever = Retriever(idx)
-        self._exem_cache: dict[tuple, np.ndarray] = {}
+        if split == "val":
+            self.samples = [(m, a) for (m, a) in all_samples if m in self.holdout]
+        elif split == "train":
+            self.samples = [(m, a) for (m, a) in all_samples if m not in self.holdout]
+        else:
+            self.samples = all_samples
+
+        # In-corpus same-action exemplar: per-(action, param) mean curve across
+        # ALL whitelisted models. This is the strong action prior the model was
+        # missing (replaces the broken B1 retrieval index). Cached on disk.
+        self.action_param_mean = build_action_param_mean(cfg, self.subset, self.targets)
 
     def __len__(self):
         return len(self.samples)
 
     def _exemplar_mean(self, model: str, action: str, names: list[str]) -> np.ndarray:
-        key = (model, action)
-        if key in self._exem_cache:
-            return self._exem_cache[key]
+        """In-corpus same-action mean curve for this sample's params (the prior)."""
         T = self.cfg.T
-        k = self.cfg.k_exemplars
-        acc = {n: [] for n in names}
-        try:
-            refs = self.retriever.retrieve_for_pack(model, action, k=k).references
-        except Exception:
-            refs = []
-        for r in refs:
-            curves = load_target_curves(
-                ROOT / self.cfg.data_root / r.pack, action, names,
-                fps=self.cfg.fps, T=T)
-            for n in names:
-                if n in curves:
-                    acc[n].append(curves[n])
-        mean = np.zeros((len(names), T), np.float32)
-        for i, n in enumerate(names):
-            if acc[n]:
-                mean[i] = np.mean(np.stack(acc[n]), 0)
-        self._exem_cache[key] = mean
-        return mean
+        exem = np.zeros((len(names), T), np.float32)
+        for i, nm in enumerate(names):
+            c = self.action_param_mean.get((action, nm))
+            if c is not None:
+                exem[i] = c
+        return exem
 
     def __getitem__(self, idx):
         model, action = self.samples[idx]
@@ -137,3 +140,32 @@ def collate(batch, max_tokens: int):
         "token_mask": torch.from_numpy(token_mask),
     }
     return out
+
+
+def build_action_param_mean(cfg, subset, targets) -> dict[tuple, np.ndarray]:
+    """Per-(action, param) mean curve across all `subset` models (the action prior).
+
+    Cached to outputs/exem_cache_{subset_models}.pkl so train/val share it and
+    reruns are instant.
+    """
+    from io_motion import list_motions, load_target_curves
+
+    cache = ROOT / "outputs" / f"exem_cache_{cfg.subset_models}.pkl"
+    if cache.exists():
+        return pickle.loads(cache.read_bytes())
+    T = cfg.T
+    acc: dict[tuple, list] = {}
+    for m in subset:
+        if m not in targets:
+            continue
+        for action in list_motions(ROOT / cfg.data_root / m):
+            curves = load_target_curves(
+                ROOT / cfg.data_root / m, action, targets[m],
+                fps=cfg.fps, T=T)
+            for p, c in curves.items():
+                acc.setdefault((action, p), []).append(np.asarray(c, np.float32))
+    mean: dict[tuple, np.ndarray] = {}
+    for k, lst in acc.items():
+        mean[k] = np.mean(np.stack(lst, 0), 0).astype(np.float32)
+    cache.write_bytes(pickle.dumps(mean))
+    return mean
