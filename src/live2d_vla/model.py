@@ -8,8 +8,9 @@ Factorised design keeps it cheap and runnable:
     * TokenMixer   : transformer over the token axis (lets e.g. left/right arms
                      share), masked by active tokens.
 The 4-way identity embedding realises f(char,action)=mu+rig+act as an *additive*
-token feature; rig comes from the static moc3 signature, action from the id +
-B1 exemplar mean fed into the loss as a target prior.
+token feature; rig comes from the learned IdentityEncoder over the static
+per-param motion-profile feature (transferable to held-out models), action from
+the id + B1 exemplar mean fed into the loss as a target prior.
 """
 from __future__ import annotations
 
@@ -127,7 +128,10 @@ class Live2DModel(nn.Module):
         self.cfg = cfg
         self.n_tokens_pad = n_tokens_pad
         self.name_enc = ParamNameEncoder(word2idx, d, cfg.name_dropout)
-        self.rig_proj = nn.Sequential(nn.Linear(cfg.rig_sig_dim, d), nn.SiLU(), nn.Linear(d, d))
+        self.identity_enc = nn.Sequential(
+            nn.Linear(cfg.rig_sig_dim, d), nn.SiLU(), nn.LayerNorm(d),
+            nn.Linear(d, d), nn.SiLU(), nn.LayerNorm(d),
+            nn.Linear(d, d))
         self.deformer = nn.Parameter(torch.zeros(d))
         self.action_emb = nn.Embedding(action_vocab_size, d)
         self.time_emb = TimestepEmbed(d)
@@ -156,7 +160,7 @@ class Live2DModel(nn.Module):
         for i in range(B):
             n = embs[i].shape[0]
             tok[i, :n] = embs[i]
-        rig_e = self.rig_proj(rig).unsqueeze(1)            # (B,1,d)
+        rig_e = self.identity_enc(rig).unsqueeze(1)        # (B,1,d) learned identity embedding
         act_e = self.action_emb(action_id).unsqueeze(1)   # (B,1,d)
         tok = tok + rig_e + act_e + self.deformer
         return tok  # (B, n_pad, d)

@@ -77,11 +77,13 @@ class Live2DDataset(Dataset):
         # missing (replaces the broken B1 retrieval index). Cached on disk.
         self.action_param_mean = build_action_param_mean(cfg, self.subset, self.targets)
 
-        # Transferable character-identity fingerprint: a fixed-length vector per
-        # model built from its STATIC motion profile (per-param range/mean
-        # distributions). Unlike the old bag-of-hash rig_sig, this is computable
-        # for ANY model (incl. held-out) from its curves, so the learned
-        # mapping actually transfers to unseen characters. Cached on disk.
+        # Transferable character-identity feature: a fixed-length STRUCTURED
+        # vector per model built from its STATIC motion profile (per-canonical-
+        # param z-scored range+mean for the top-K most identity-informative
+        # params). Unlike the old bag-of-hash rig_sig / coarse 2-histogram, this
+        # preserves per-param structural identity and is computable for ANY model
+        # (incl. held-out) from its curves, so the learned mapping transfers.
+        # Cached on disk. Consumed by the learnable IdentityEncoder in model.py.
         self.model_ident = build_model_identity(cfg, self.subset, self.targets)
 
     def __len__(self):
@@ -179,48 +181,28 @@ def build_action_param_mean(cfg, subset, targets) -> dict[tuple, np.ndarray]:
     return mean
 
 
-def _ident_fingerprint(ranges: np.ndarray, means: np.ndarray, dim: int) -> np.ndarray:
-    """Fixed-length, transferable model-identity fingerprint from per-param
-    range/mean distributions.
+def build_model_identity(cfg, subset, targets, K: int = 48) -> dict[str, np.ndarray]:
+    """Per-model transferable identity FEATURE (the `rig` branch input).
 
-    Two normalized histograms (range-profile + mean-profile), each of dim/2 bins.
-    Ranges/means are normalized by their own global stats so the fingerprint is
-    comparable across models in the shared CANON param space. This is the
-    principled replacement for the bag-of-hash rig_sig: it is a STATIC property
-    of the model (its overall motion profile) that can be computed for held-out
-    characters too, so a mapping learned on train models transfers.
-    """
-    out = np.zeros(dim, np.float32)
-    half = dim // 2
-    if ranges.size == 0:
-        return out
-    r = ranges / (ranges.max() + 1e-6)                       # normalized range profile
-    m = means / (np.abs(means).max() + 1e-6)                # normalized mean profile
-    rh, _ = np.histogram(r, bins=half, range=(0.0, 1.0))
-    mh, _ = np.histogram(m, bins=dim - half, range=(-1.0, 1.0))
-    if rh.sum() > 0:
-        rh = rh / rh.sum()
-    if mh.sum() > 0:
-        mh = mh / mh.sum()
-    out[:half] = rh.astype(np.float32)
-    out[half:] = mh.astype(np.float32)
-    return out
+    Replaces the old bag-of-hash / coarse 2-histogram signature with a STRUCTURED
+    per-canonical-param feature: rank all params by how much they vary across
+    characters (global range-variance), keep the top-K most identity-informative
+    ones, and for each emit a z-scored (range, mean) pair. Output is a fixed
+    `cfg.rig_sig_dim`-dim vector (= 2*K, padded/truncated).
 
-
-def build_model_identity(cfg, subset, targets) -> dict[str, np.ndarray]:
-    """Per-model transferable identity fingerprint (the new `rig` branch input).
-
-    For each model, accumulate per-param (min, max, mean) over ALL its motion
-    curves, then summarise into a fixed-length fingerprint via _ident_fingerprint.
-    Cached to outputs/ident_cache_{subset_models}.pkl so train/val share it and
-    reruns are instant.
+    Crucially this is still a STATIC property computable from a model's own curves
+    alone (using the global normalizers cached here), so it transfers to held-out
+    characters; and being per-param (not a single histogram) it preserves the
+    character's structural identity far better. Cached to disk (v2 key).
     """
     from io_motion import list_motions, load_target_curves
 
-    cache = ROOT / "outputs" / f"ident_cache_{cfg.subset_models}.pkl"
+    cache = ROOT / "outputs" / f"ident_cache_{cfg.subset_models}_v2.pkl"
     if cache.exists():
         return pickle.loads(cache.read_bytes())
+
     T = cfg.T
+    # 1) aggregate per-model per-param (min, max, sum, cnt) over all its curves
     per_model: dict[str, dict[str, list]] = {}
     for m in subset:
         if m not in targets:
@@ -228,8 +210,7 @@ def build_model_identity(cfg, subset, targets) -> dict[str, np.ndarray]:
         per_model[m] = {}
         for action in list_motions(ROOT / cfg.data_root / m):
             curves = load_target_curves(
-                ROOT / cfg.data_root / m, action, targets[m],
-                fps=cfg.fps, T=T)
+                ROOT / cfg.data_root / m, action, targets[m], fps=cfg.fps, T=T)
             for p, c in curves.items():
                 a = np.asarray(c, np.float32).ravel()
                 if a.size == 0:
@@ -239,15 +220,40 @@ def build_model_identity(cfg, subset, targets) -> dict[str, np.ndarray]:
                 d[1] = max(d[1], float(a.max()))
                 d[2] += float(a.mean())
                 d[3] += 1
+
+    # 2) global per-param stats (over models) + select top-K by range-variance
+    per_param: dict[str, list] = {}
+    for m, pmap in per_model.items():
+        for p, d in pmap.items():
+            per_param.setdefault(p, []).append(
+                (d[0], d[1], d[2] / d[3] if d[3] > 0 else 0.0))
+    global_stat: dict[str, tuple] = {}
+    for p, vals in per_param.items():
+        rngs = np.array([v[1] - v[0] for v in vals], np.float32)
+        means = np.array([v[2] for v in vals], np.float32)
+        global_stat[p] = (rngs.mean(), rngs.std() + 1e-6,
+                          means.mean(), means.std() + 1e-6)
+    order = sorted(global_stat.keys(),
+                   key=lambda p: global_stat[p][1], reverse=True)
+    K = min(K, len(order))
+    selected = order[:K]
+    sel_idx = {p: i for i, p in enumerate(selected)}
+    feat_dim = cfg.rig_sig_dim
+    half = feat_dim // 2
+
+    # 3) build the fixed-dim structured feature per model
     ident: dict[str, np.ndarray] = {}
     for m, pmap in per_model.items():
-        ranges_l, means_l = [], []
+        vec = np.zeros(feat_dim, np.float32)
         for p, d in pmap.items():
-            if d[3] > 0:
-                ranges_l.append(d[1] - d[0])
-                means_l.append(d[2] / d[3])
-        ident[m] = _ident_fingerprint(
-            np.asarray(ranges_l, np.float32), np.asarray(means_l, np.float32),
-            cfg.rig_sig_dim)
+            i = sel_idx.get(p)
+            if i is None or i >= half:
+                continue
+            rng = d[1] - d[0]
+            mn = d[2] / d[3] if d[3] > 0 else 0.0
+            rm, rs, mm, ms = global_stat[p]
+            vec[2 * i]     = float(np.clip((rng - rm) / rs, -3.0, 3.0))   # z-range
+            vec[2 * i + 1] = float(np.clip((mn - mm) / ms, -3.0, 3.0))    # z-mean
+        ident[m] = vec
     cache.write_bytes(pickle.dumps(ident))
     return ident

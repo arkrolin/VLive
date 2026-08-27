@@ -19,7 +19,7 @@ class PipelineConfig:
     subset_models: int = 60           # first N whitelisted models (MVP scope)
     k_exemplars: int = 3              # B1 cross-character same-action references
     max_tokens: int = 128             # pad the per-model token dim to this
-    rig_sig_dim: int = 64             # bag-of-hash-buckets rig signature (proxy)
+    rig_sig_dim: int = 96             # structured per-param identity feature (2*K, K=48)
 
     # ---- model ----
     d_model: int = 384
