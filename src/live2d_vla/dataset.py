@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from schema import load_whitelist, load_gen_mask, build_vocab, rig_signature  # noqa: E402
+from schema import load_whitelist, load_gen_mask, build_vocab  # noqa: E402
 from io_motion import load_target_curves                                       # noqa: E402
 
 
@@ -77,6 +77,13 @@ class Live2DDataset(Dataset):
         # missing (replaces the broken B1 retrieval index). Cached on disk.
         self.action_param_mean = build_action_param_mean(cfg, self.subset, self.targets)
 
+        # Transferable character-identity fingerprint: a fixed-length vector per
+        # model built from its STATIC motion profile (per-param range/mean
+        # distributions). Unlike the old bag-of-hash rig_sig, this is computable
+        # for ANY model (incl. held-out) from its curves, so the learned
+        # mapping actually transfers to unseen characters. Cached on disk.
+        self.model_ident = build_model_identity(cfg, self.subset, self.targets)
+
     def __len__(self):
         return len(self.samples)
 
@@ -102,7 +109,8 @@ class Live2DDataset(Dataset):
         if not names:
             names = target_params[:1]
         target = np.stack([curves[n] for n in names], 0).astype(np.float32)  # (n,T)
-        rig = rig_signature(ROOT / self.cfg.data_root / model, dim=self.cfg.rig_sig_dim)
+        # transferable character-identity fingerprint (replaces bag-of-hash rig_sig)
+        rig = self.model_ident.get(model, np.zeros(self.cfg.rig_sig_dim, np.float32))
         exem = self._exemplar_mean(model, action, names)
         return {
             "names": names,
@@ -169,3 +177,77 @@ def build_action_param_mean(cfg, subset, targets) -> dict[tuple, np.ndarray]:
         mean[k] = np.mean(np.stack(lst, 0), 0).astype(np.float32)
     cache.write_bytes(pickle.dumps(mean))
     return mean
+
+
+def _ident_fingerprint(ranges: np.ndarray, means: np.ndarray, dim: int) -> np.ndarray:
+    """Fixed-length, transferable model-identity fingerprint from per-param
+    range/mean distributions.
+
+    Two normalized histograms (range-profile + mean-profile), each of dim/2 bins.
+    Ranges/means are normalized by their own global stats so the fingerprint is
+    comparable across models in the shared CANON param space. This is the
+    principled replacement for the bag-of-hash rig_sig: it is a STATIC property
+    of the model (its overall motion profile) that can be computed for held-out
+    characters too, so a mapping learned on train models transfers.
+    """
+    out = np.zeros(dim, np.float32)
+    half = dim // 2
+    if ranges.size == 0:
+        return out
+    r = ranges / (ranges.max() + 1e-6)                       # normalized range profile
+    m = means / (np.abs(means).max() + 1e-6)                # normalized mean profile
+    rh, _ = np.histogram(r, bins=half, range=(0.0, 1.0))
+    mh, _ = np.histogram(m, bins=dim - half, range=(-1.0, 1.0))
+    if rh.sum() > 0:
+        rh = rh / rh.sum()
+    if mh.sum() > 0:
+        mh = mh / mh.sum()
+    out[:half] = rh.astype(np.float32)
+    out[half:] = mh.astype(np.float32)
+    return out
+
+
+def build_model_identity(cfg, subset, targets) -> dict[str, np.ndarray]:
+    """Per-model transferable identity fingerprint (the new `rig` branch input).
+
+    For each model, accumulate per-param (min, max, mean) over ALL its motion
+    curves, then summarise into a fixed-length fingerprint via _ident_fingerprint.
+    Cached to outputs/ident_cache_{subset_models}.pkl so train/val share it and
+    reruns are instant.
+    """
+    from io_motion import list_motions, load_target_curves
+
+    cache = ROOT / "outputs" / f"ident_cache_{cfg.subset_models}.pkl"
+    if cache.exists():
+        return pickle.loads(cache.read_bytes())
+    T = cfg.T
+    per_model: dict[str, dict[str, list]] = {}
+    for m in subset:
+        if m not in targets:
+            continue
+        per_model[m] = {}
+        for action in list_motions(ROOT / cfg.data_root / m):
+            curves = load_target_curves(
+                ROOT / cfg.data_root / m, action, targets[m],
+                fps=cfg.fps, T=T)
+            for p, c in curves.items():
+                a = np.asarray(c, np.float32).ravel()
+                if a.size == 0:
+                    continue
+                d = per_model[m].setdefault(p, [np.inf, -np.inf, 0.0, 0])
+                d[0] = min(d[0], float(a.min()))
+                d[1] = max(d[1], float(a.max()))
+                d[2] += float(a.mean())
+                d[3] += 1
+    ident: dict[str, np.ndarray] = {}
+    for m, pmap in per_model.items():
+        ranges_l, means_l = [], []
+        for p, d in pmap.items():
+            if d[3] > 0:
+                ranges_l.append(d[1] - d[0])
+                means_l.append(d[2] / d[3])
+        ident[m] = _ident_fingerprint(
+            np.asarray(ranges_l, np.float32), np.asarray(means_l, np.float32),
+            cfg.rig_sig_dim)
+    cache.write_bytes(pickle.dumps(ident))
+    return ident
