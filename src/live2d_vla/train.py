@@ -191,9 +191,21 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     x0 = ((target - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
     exem_s = ((exem - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
     B = x0.shape[0]
-    t = torch.randint(0, cfg.num_diff_steps, (B,), device=device, dtype=torch.long)
-    noise = torch.randn_like(x0)
-    x_t = q_model.q_sample(x0, t, noise, alphabar)
+    if getattr(cfg, "gen_mode", "ddpm") == "regress":
+        # P1 arm A: deterministic residual regression - no noise, t=0. The model
+        # still outputs exem + residual, so it starts exactly at the prior and
+        # only learns the correction. Tests whether the diffusion formulation
+        # itself is the bottleneck.
+        t = torch.zeros(B, device=device, dtype=torch.long)
+        x_t = torch.zeros_like(x0)
+    else:
+        # P1 arm C: truncated schedule - cap the noise level. With a very strong
+        # prior, fully destroying the signal (t up to 1000) may be counterproductive.
+        t_max = min(int(getattr(cfg, "max_diff_t", cfg.num_diff_steps)),
+                    cfg.num_diff_steps)
+        t = torch.randint(0, t_max, (B,), device=device, dtype=torch.long)
+        noise = torch.randn_like(x0)
+        x_t = q_model.q_sample(x0, t, noise, alphabar)
     # x0-PREDICTION: network regresses clean x0 directly (+ exem prior).
     # loss = masked MSE(x0_hat, x0) in fraction-of-range units == rel_mae^2.
     x0_hat = model(x_t, t, names, rig, action_id, token_mask, exem_s, training=True)
@@ -210,10 +222,17 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
-                 device, steps: int = 50, eta: float = 0.0):
-    """x0-prediction DDIM reverse: x0_hat (per-param std units) from x_T."""
+                 device, steps: int = 50, eta: float = 0.0, t_start: int = None):
+    """x0-prediction DDIM reverse: x0_hat (per-param std units) from x_T.
+
+    t_start: highest timestep index to reverse from. Defaults to S-1 (full
+    diffusion); pass < S for a truncated schedule (P1 ablation arm C), which
+    must match the `max_diff_t` used during training.
+    """
     S = alphabar.shape[0]
-    ts = torch.linspace(S - 1, 0, steps).long()   # descending
+    hi = (S - 1) if t_start is None else min(int(t_start), S) - 1
+    hi = max(hi, 1)
+    ts = torch.linspace(hi, 0, steps).long()   # descending
     x = x_T
     for i in range(steps):
         t_cur = ts[i]
@@ -236,16 +255,28 @@ def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar
     return x0_hat * token_mask.unsqueeze(-1)
 
 
+METRIC_KEYS = ("abs", "rel", "rel_f", "exem_abs", "exem_rel", "exem_rel_f")
+
+
 @torch.no_grad()
 def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
                   alphabar, n_batches: int, steps: int = 50):
-    """DDIM reconstruction error on a (capped) val loader.
+    """Reconstruction error for the MODEL *and* the EXEM PRIOR on identical batches.
 
-    Returns (abs_mae_units, rel_mae). Because x0 is range-normalized, rel_mae
-    = mean |x0_hat - x0| (fraction of param range).
+    Two relative-error variants are reported because the training loss and the
+    legacy metric used DIFFERENT span definitions (see P0 diagnosis):
+      rel     : / raw per-param span (floor 1e-3)  -> legacy. 74.4% of param
+                instances are near-constant yet supply 94.5% of this number.
+      rel_f   : / span floored at 2% of the global range -> ALIGNED with the
+                training loss. In normalised units it is just mean_t|x0_hat-x0|.
+    The exem prior is scored on the same batches, so any model can be compared
+    directly against "just output the action mean" - which is the comparison
+    that actually matters.
     """
     model.eval()
-    abs_sum, rel_sum, cnt = 0.0, 0.0, 0
+    min_span = max(g_hi - g_lo, 1.0) * 0.02
+    acc = {k: 0.0 for k in METRIC_KEYS}
+    cnt = 0
     for bi, batch in enumerate(loader):
         if bi >= n_batches:
             break
@@ -258,30 +289,43 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi, cfg.max_tokens)
         lo_t = torch.from_numpy(lo_v).to(device)
         hi_t = torch.from_numpy(hi_v).to(device)
-        min_span = max(g_hi - g_lo, 1.0) * 0.02
-        span_t = (hi_t - lo_t).clamp(min=min_span)
+        span_t = (hi_t - lo_t).clamp(min=min_span)      # loss-aligned span
+        span_raw_t = (hi_t - lo_t).clamp(min=1e-3)      # legacy metric span
         exem_s = ((batch["exem"].to(device) - lo_t.unsqueeze(-1))
                   / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
-        x_T = torch.randn(B, n, T, device=device)
-        x0_hat = ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s,
-                              alphabar, device, steps=steps)
+        x0 = ((target - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
+
+        if getattr(cfg, "gen_mode", "ddpm") == "regress":
+            t0 = torch.zeros(B, device=device, dtype=torch.long)
+            x0_hat = model(torch.zeros_like(x0), t0, names, rig, action_id,
+                           token_mask, exem_s, training=False)
+        else:
+            x_T = torch.randn(B, n, T, device=device)
+            x0_hat = ddim_reverse(
+                model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
+                device, steps=steps,
+                t_start=int(getattr(cfg, "max_diff_t", 1000)))
         x0_hat = x0_hat.clamp(-0.5, 1.5)
-        x0_hat_u = x0_hat * span_t.unsqueeze(-1) + lo_t.unsqueeze(-1)  # param units
-        err = (x0_hat_u - target).abs()                  # (B,n,T)
-        for b in range(B):
-            for j in range(n):
-                if token_mask[b, j] < 0.5:
-                    continue
-                nm = names[b][j]
-                lo = per_lo.get(nm, g_lo)
-                hi = per_hi.get(nm, g_hi)
-                span = max(hi - lo, 1e-3)
-                e = err[b, j].mean().item()
-                abs_sum += e
-                rel_sum += min(e / span, 2.0)   # clamp pathological near-constant params
-                cnt += 1
+
+        for pred, pre in ((x0_hat, ""), (exem_s, "exem_")):
+            err_n = (pred - x0).abs()                    # (B,n,T), normalised units
+            for b in range(B):
+                for j in range(n):
+                    if token_mask[b, j] < 0.5:
+                        continue
+                    e_f = err_n[b, j].mean().item()      # loss-aligned rel error
+                    sp = float(span_t[b, j].item())
+                    sp_raw = float(span_raw_t[b, j].item())
+                    e_abs = e_f * sp                     # raw param units
+                    acc[pre + "abs"] += e_abs
+                    acc[pre + "rel_f"] += min(e_f, 2.0)
+                    acc[pre + "rel"] += min(e_abs / sp_raw, 2.0)
+                    if pre == "":
+                        cnt += 1
     model.train()
-    return abs_sum / max(cnt, 1), rel_sum / max(cnt, 1)
+    out = {k: acc[k] / max(cnt, 1) for k in METRIC_KEYS}
+    out["n_params"] = cnt
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -296,6 +340,11 @@ def parse_args():
                    help="cap total optimizer steps (smoke test)")
     p.add_argument("--eval_every", type=int, default=None,
                    help="epochs between DDIM reconstruction metric (default config)")
+    p.add_argument("--gen_mode", type=str, default=None,
+                   choices=["ddpm", "regress"],
+                   help="P1 ablation: ddpm (diffusion) | regress (deterministic residual)")
+    p.add_argument("--max_diff_t", type=int, default=None,
+                   help="P1 ablation: truncate noise sampling to t < max_diff_t")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -320,6 +369,10 @@ def main():
         cfg.lr = args.lr
     if args.eval_every is not None:
         cfg.eval_every = args.eval_every
+    if args.gen_mode is not None:
+        cfg.gen_mode = args.gen_mode
+    if args.max_diff_t is not None:
+        cfg.max_diff_t = args.max_diff_t
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     device, rank, world_size, ddp = setup_dist()
@@ -335,6 +388,8 @@ def main():
         print(f"[rank{rank}] train samples={len(train_ds)} val samples={len(val_ds)} "
               f"params_vocab={len(train_ds.param2idx)} actions={action_vocab_size} "
               f"val_models={len(val_ds.holdout)}")
+        print(f"[rank{rank}] gen_mode={cfg.gen_mode} max_diff_t={cfg.max_diff_t} "
+              f"eval_shared_min_models={cfg.eval_shared_min_models}")
 
     model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad)
     model.to(device)
@@ -391,11 +446,15 @@ def main():
     if is_main(rank) and not (csv_path.exists() and not args.fresh and start_epoch > 0):
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["epoch", "train_loss", "val_loss", "val_abs_mae",
-                        "val_rel_mae", "lr", "best"])
+            w.writerow(["epoch", "train_loss", "val_loss",
+                        "val_abs_mae", "val_rel_mae", "val_rel_mae_f",
+                        "exem_abs_mae", "exem_rel_mae", "exem_rel_mae_f",
+                        "lr", "best"])
 
     best_val, epochs_no_improve = float("inf"), 0
     global_step = start_epoch * steps_per_epoch
+    nan_m = {k: float("nan") for k in METRIC_KEYS}
+    best_m = dict(nan_m)
 
     # ---- training loop ----
     for epoch in range(start_epoch, cfg.epochs):
@@ -436,7 +495,7 @@ def main():
 
         # ---- validation (rank 0 only) ----
         val_loss = float("nan")
-        val_abs, val_rel = float("nan"), float("nan")
+        m = dict(nan_m)
         if is_main(rank):
             dmodel.eval()
             v_sum, v_cnt = 0.0, 0
@@ -451,7 +510,7 @@ def main():
                     v_cnt += 1
             val_loss = v_sum / max(v_cnt, 1)
             if epoch + 1 >= cfg.eval_every or epoch == cfg.epochs - 1:
-                val_abs, val_rel = recon_metrics(
+                m = recon_metrics(
                     dmodel, val_loader, device, cfg, per_lo, per_hi,
                     g_lo, g_hi, alphabar,
                     n_batches=cfg.val_recon_batches, steps=50)
@@ -460,6 +519,7 @@ def main():
             improved = val_loss < best_val - 1e-4
             if improved:
                 best_val = val_loss
+                best_m = m
                 epochs_no_improve = 0
                 torch.save({
                     "model": dmodel.state_dict(), "optim": optimizer.state_dict(),
@@ -472,11 +532,14 @@ def main():
             with open(csv_path, "a", newline="") as f:
                 w = csv.writer(f)
                 w.writerow([epoch + 1, f"{train_loss:.4f}", f"{val_loss:.4f}",
-                            f"{val_abs:.4f}", f"{val_rel:.4f}", f"{lr:.2e}",
+                            f"{m['abs']:.4f}", f"{m['rel']:.4f}", f"{m['rel_f']:.4f}",
+                            f"{m['exem_abs']:.4f}", f"{m['exem_rel']:.4f}",
+                            f"{m['exem_rel_f']:.4f}", f"{lr:.2e}",
                             f"{best_val:.4f}"])
             print(f"[rank{rank}] ep {epoch + 1} train={train_loss:.4f} "
                   f"val={val_loss:.4f} (best {best_val:.4f}) "
-                  f"recon_abs={val_abs:.3f} rel={val_rel:.3f} "
+                  f"rel_f={m['rel_f']:.4f} exem_rel_f={m['exem_rel_f']:.4f} | "
+                  f"abs={m['abs']:.3f} exem_abs={m['exem_abs']:.3f} "
                   f"gap={val_loss / max(train_loss,1e-6):.2f}x "
                   f"noimp={epochs_no_improve}")
 
@@ -510,7 +573,10 @@ def main():
     # ---- final report / gate ----
     if is_main(rank):
         overfit = val_loss / max(train_loss, 1e-6)
-        rel_ok = (val_rel != val_rel) or (val_rel <= REL_MAE_TARGET)
+        rel_f, exem_rel_f = best_m["rel_f"], best_m["exem_rel_f"]
+        rel_ok = (rel_f != rel_f) or (rel_f <= REL_MAE_TARGET)
+        # The comparison that actually matters: does the model beat its own prior?
+        beats = (rel_f == rel_f and exem_rel_f == exem_rel_f and rel_f < exem_rel_f)
         passed = (train_loss <= TRAIN_TARGET and val_loss <= VAL_TARGET
                   and overfit <= OVERFIT_MAX and rel_ok)
         print("\n==================== TRAINING GATE ====================")
@@ -520,9 +586,14 @@ def main():
               f"{'OK' if val_loss <= VAL_TARGET else 'FAIL'}")
         print(f"  overfit ratio= {overfit:.3f}x  (target <= {OVERFIT_MAX}) "
               f"{'OK' if overfit <= OVERFIT_MAX else 'FAIL'}")
-        rc = "n/a" if val_rel != val_rel else f"{val_rel:.4f}"
-        print(f"  val_rel_mae  = {rc}   (target <= {REL_MAE_TARGET}) "
+        rc = "n/a" if rel_f != rel_f else f"{rel_f:.4f}"
+        print(f"  val_rel_mae_f (loss-aligned) = {rc}  (target <= {REL_MAE_TARGET}) "
               f"{'OK' if rel_ok else 'FAIL'}")
+        ec = "n/a" if exem_rel_f != exem_rel_f else f"{exem_rel_f:.4f}"
+        print(f"  exem prior rel_mae_f         = {ec}  (baseline to beat)")
+        print(f"  BEATS EXEM PRIOR             = {'YES' if beats else 'NO'}"
+              f"   ({'model better' if beats else 'model NOT better than its prior'})")
+        print(f"  val_abs_mae  = {best_m['abs']:.4f}  vs exem {best_m['exem_abs']:.4f}")
         print(f"  GATE: {'PASS' if passed else 'NOT YET MET'}")
         print("=======================================================")
 

@@ -50,4 +50,18 @@ class PipelineConfig:
     early_stop_patience: int = 15     # stop if val_loss not improved for N epochs
     val_recon_batches: int = 16       # cap val reconstruction cost per eval
 
+    # ---- honest evaluation (P0) ----
+    # Evaluate only on actions shared by >= N models. The deployment task is
+    # "known action, new character"; actions unique to one model make the exem
+    # prior degenerate (the (action,param) mean IS that model's own curve), so
+    # those samples contribute no generalization signal and dilute every metric.
+    # Measured: 72% of actions occur in only one model (subset=60).
+    eval_shared_min_models: int = 5
+
+    # ---- generation formulation (P1 ablation) ----
+    # The exem prior is very strong (abs_mae=0.47 vs the model's 2.02-3.37), so
+    # DDPM-from-pure-noise may be actively destroying it. These knobs ablate it.
+    gen_mode: str = "ddpm"            # "ddpm" | "regress" (deterministic residual)
+    max_diff_t: int = 1000            # sample t in [0, max_diff_t); <1000 truncates
+
     out_dir: Path = ROOT / "outputs" / "train_runs"

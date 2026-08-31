@@ -6,6 +6,7 @@ Live2d-model-master.zip
 *.motion3.json
 *.physics3.json
 *.cubism
+Live2d-model-master/
 
 # ---- python env / caches ----
 .venv/

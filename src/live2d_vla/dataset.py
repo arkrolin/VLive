@@ -57,6 +57,14 @@ class Live2DDataset(Dataset):
         self.action2idx, _ = _build_action_vocab(all_samples) if action_vocab is None \
             else (action_vocab, list(action_vocab))
 
+        # How many models share each action. Needed to build an HONEST val split:
+        # 72% of actions occur in only one model, and for those the exem prior
+        # (the (action,param) mean) is literally that model's own curve, so the
+        # sample measures memorisation, not generalisation.
+        self.action_nmodels: dict[str, int] = {}
+        for _, a in all_samples:
+            self.action_nmodels[a] = self.action_nmodels.get(a, 0) + 1
+
         # deterministic whole-model holdout
         if cfg.val_frac and cfg.val_frac > 0:
             rng = random.Random(cfg.seed)
@@ -67,6 +75,14 @@ class Live2DDataset(Dataset):
 
         if split == "val":
             self.samples = [(m, a) for (m, a) in all_samples if m in self.holdout]
+            # P0: keep only actions shared by >= N models. This is the real
+            # deployment task ("known action, new character") and the only honest
+            # generalisation test. Training still uses every sample.
+            k = getattr(cfg, "eval_shared_min_models", 0)
+            if k and k > 0:
+                kept = [s for s in self.samples if self.action_nmodels[s[1]] >= k]
+                if kept:
+                    self.samples = kept
         elif split == "train":
             self.samples = [(m, a) for (m, a) in all_samples if m not in self.holdout]
         else:
