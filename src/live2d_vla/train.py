@@ -24,19 +24,26 @@ Validation (held-out *whole models*, character generalization):
     * val_abs_mae: DDIM-reverse reconstruction error in ORIGINAL param units
     * val_rel_mae: mean |x0_hat - x0|  -> deployment fidelity (% of range)
 
-Acceptance gate (printed, logged, and asserted at the end):
-    Calibrated baselines (CPU, held-out val, arm_w=3):
-        exem-only recon: abs_mae=0.4706  rel_mae=0.0551
-        => the in-corpus exemplar prior is very strong (5.5% of range). The
-           range-norm loss floor is exem rel^2 ~0.003. The model converges near
-           the exem rel (no character-identity signal -> bounded by exem prior).
-    Targets (the model must reach ~exem fidelity, not worse):
-        train_loss   <= TRAIN_TARGET  (0.05)   [range-norm MSE]
-        val_loss     <= VAL_TARGET    (0.06)   [range-norm MSE; ~1.4x the 0.042 floor]
-        overfit      = val_loss/train_loss <= OVERFIT_MAX (1.30)  [no runaway]
-        val_rel_mae  <= REL_MAE_TARGET (0.15)  [recon within 15% of param range]
-    Going materially below exem rel needs a learned character-identity embedding
-    (replace bag-of-hash rig_sig) - the next architecture step, not a hyperparam.
+Acceptance gate (recalibrated 2026-09-01, printed at the end):
+    [1] BEATS EXEM PRIOR - model abs_mae must beat the exem prior by >= 10%.
+        (primary criterion; see the note on the old targets below)
+    [2] val_rel_mae_f <= RELF_TARGET (0.05)   [loss-aligned rel error]
+    [3] train_loss    <= TRAIN_TARGET (0.09)  [sanity: optimisation converged]
+
+    Why the old targets (val_loss<=0.06, overfit<=1.30) were dropped as gate
+    criteria: they were calibrated against the pre-P0 metric, which mixed in
+    memorisation samples (72% of actions belong to a single model) and used a
+    span definition inconsistent with the training loss. They produced a false
+    PASS - the ddpm@285 arm printed "GATE: PASS" while "BEATS EXEM PRIOR = NO".
+    val_loss is also NOT comparable across generation formulations: a truncated
+    schedule makes the denoising task trivially easier, so the t200 arm had the
+    lowest val_loss (0.0150) and by far the worst reconstruction (25-87).
+    val_loss / overfit are still printed, but as diagnostics only.
+
+    Measured reference points (shared-action held-out val):
+        subset=60  : exem prior abs_mae=0.7379
+        subset=285 : exem prior abs_mae=2.4405 (harder: 34 held-out characters)
+        best so far: regress@285 abs_mae=1.1986 (51% better than its prior)
 
 Run:
     torchrun --nproc_per_node=7 src/live2d_vla/train.py --epochs 50
@@ -66,13 +73,25 @@ from config import PipelineConfig
 from dataset import Live2DDataset, collate
 from model import Live2DModel
 
-# ---- acceptance targets (the "expected metrics", calibrated; see docstring) ----
-# Range-normalized loss units (fraction of param range). Robust exem floor ~0.042.
-# The model must reach ~exem fidelity (rel_mae ~0.055-0.12), not worse.
-TRAIN_TARGET = 0.09      # range-norm MSE (train sits just above the 0.042 floor)
-VAL_TARGET = 0.06        # held-out; ~1.4x the 0.042 exem floor
-OVERFIT_MAX = 1.30       # val_loss / train_loss (no runaway overfit)
-REL_MAE_TARGET = 0.15    # reconstruction error as fraction of param range
+# ---- acceptance targets ---------------------------------------------------- #
+# RECALIBRATED 2026-09-01 against the honest shared-action eval.
+#
+# The old targets (val_loss<=0.06, overfit<=1.30) were calibrated against the
+# pre-P0 metric, which mixed in memorisation samples (72% of actions belong to a
+# single model) and used a span definition inconsistent with the training loss.
+# They produced a false PASS: the ddpm@285 arm printed "GATE: PASS" while
+# "BEATS EXEM PRIOR = NO" - i.e. the gate passed on a model that was worse than
+# just outputting the action mean.
+#
+# The only criterion that survives every ablation is:
+#     does the model beat the exem prior it is initialised to?
+# val_loss / overfit are still reported, but as DIAGNOSTICS only: val_loss is not
+# comparable across generation formulations (a truncated schedule makes the
+# denoising task trivially easier - the t200 arm had the lowest val_loss 0.0150
+# and by far the worst reconstruction 25-87).
+TRAIN_TARGET = 0.09        # range-norm MSE on train (sanity: optimisation works)
+RELF_TARGET = 0.05         # loss-aligned rel_mae (fraction of floored span)
+BEATS_EXEM_MIN_GAIN = 0.10 # model abs_mae must beat exem by >= 10% to count
 
 # Arm / upper-body channels get higher loss weight (V7.1 action prior).
 ARM_KEYWORDS = {
@@ -589,26 +608,27 @@ def main():
     if is_main(rank):
         overfit = val_loss / max(train_loss, 1e-6)
         rel_f, exem_rel_f = best_m["rel_f"], best_m["exem_rel_f"]
-        rel_ok = (rel_f != rel_f) or (rel_f <= REL_MAE_TARGET)
-        # The comparison that actually matters: does the model beat its own prior?
-        beats = (rel_f == rel_f and exem_rel_f == exem_rel_f and rel_f < exem_rel_f)
-        passed = (train_loss <= TRAIN_TARGET and val_loss <= VAL_TARGET
-                  and overfit <= OVERFIT_MAX and rel_ok)
-        print("\n==================== TRAINING GATE ====================")
-        print(f"  train_loss   = {train_loss:.4f}   (target <= {TRAIN_TARGET}) "
-              f"{'OK' if train_loss <= TRAIN_TARGET else 'FAIL'}")
-        print(f"  val_loss     = {val_loss:.4f}   (target <= {VAL_TARGET}) "
-              f"{'OK' if val_loss <= VAL_TARGET else 'FAIL'}")
-        print(f"  overfit ratio= {overfit:.3f}x  (target <= {OVERFIT_MAX}) "
-              f"{'OK' if overfit <= OVERFIT_MAX else 'FAIL'}")
+        m_abs, e_abs = best_m["abs"], best_m["exem_abs"]
+        train_ok = train_loss <= TRAIN_TARGET
+        rel_ok = (rel_f != rel_f) or (rel_f <= RELF_TARGET)
+        # The comparison that actually matters, and the only one that survived
+        # every ablation: beat the prior the model is initialised to, by a
+        # margin that is not explainable by noise.
+        gain = (e_abs - m_abs) / e_abs if (e_abs == e_abs and e_abs > 0) else float("nan")
+        beats = (gain == gain) and (gain >= BEATS_EXEM_MIN_GAIN)
+        passed = train_ok and rel_ok and beats
         rc = "n/a" if rel_f != rel_f else f"{rel_f:.4f}"
-        print(f"  val_rel_mae_f (loss-aligned) = {rc}  (target <= {REL_MAE_TARGET}) "
+        print("\n==================== TRAINING GATE ====================")
+        print(f"  [1] BEATS EXEM PRIOR  : {'YES' if beats else 'NO'}   "
+              f"abs_mae {m_abs:.4f} vs exem {e_abs:.4f}  "
+              f"(gain {gain * 100:+.1f}%, need >= {BEATS_EXEM_MIN_GAIN * 100:.0f}%)")
+        print(f"  [2] val_rel_mae_f     : {rc}  (target <= {RELF_TARGET}) "
               f"{'OK' if rel_ok else 'FAIL'}")
-        ec = "n/a" if exem_rel_f != exem_rel_f else f"{exem_rel_f:.4f}"
-        print(f"  exem prior rel_mae_f         = {ec}  (baseline to beat)")
-        print(f"  BEATS EXEM PRIOR             = {'YES' if beats else 'NO'}"
-              f"   ({'model better' if beats else 'model NOT better than its prior'})")
-        print(f"  val_abs_mae  = {best_m['abs']:.4f}  vs exem {best_m['exem_abs']:.4f}")
+        print(f"  [3] train_loss        : {train_loss:.4f}  "
+              f"(target <= {TRAIN_TARGET}) {'OK' if train_ok else 'FAIL'}")
+        print("  --- diagnostics only (NOT comparable across formulations) ---")
+        print(f"      val_loss={val_loss:.4f}  overfit={overfit:.3f}x  "
+              f"rel_mae(legacy)={best_m['rel']:.4f} vs exem {best_m['exem_rel']:.4f}")
         print(f"  GATE: {'PASS' if passed else 'NOT YET MET'}")
         print("=======================================================")
 
