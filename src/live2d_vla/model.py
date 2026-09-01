@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from schema import ParamNameEncoder
+from schema import ParamNameEncoder, ActionNameEncoder
 
 
 # --------------------------------------------------------------------------- #
@@ -122,7 +122,8 @@ class TokenMixBlock(nn.Module):
 # diffusion model
 # --------------------------------------------------------------------------- #
 class Live2DModel(nn.Module):
-    def __init__(self, cfg, word2idx, action_vocab_size, n_tokens_pad):
+    def __init__(self, cfg, word2idx, action_vocab_size, n_tokens_pad,
+                 action_char2idx=None):
         super().__init__()
         d = cfg.d_model
         self.cfg = cfg
@@ -133,7 +134,20 @@ class Live2DModel(nn.Module):
             nn.Linear(d, d), nn.SiLU(), nn.LayerNorm(d),
             nn.Linear(d, d))
         self.deformer = nn.Parameter(torch.zeros(d))
-        self.action_emb = nn.Embedding(action_vocab_size, d)
+        # ---- action conditioning (P2) ----
+        # "id"   : plain lookup - degenerates into a memorisation table at
+        #          ~4.4 samples per action (1679 actions / 7382 samples).
+        # "name" : compositional char-level encoder over the semantic pinyin
+        #          action name - shares statistics, handles unseen names.
+        self.action_cond = getattr(cfg, "action_cond", "id")
+        if self.action_cond in ("id", "both"):
+            self.action_emb = nn.Embedding(action_vocab_size, d)
+        if self.action_cond in ("name", "both"):
+            if action_char2idx is None:
+                raise ValueError("action_cond='name' requires action_char2idx")
+            self.action_name_enc = ActionNameEncoder(
+                action_char2idx, d, getattr(cfg, "action_name_max_len", 32),
+                getattr(cfg, "action_dropout", 0.0))
         self.time_emb = TimestepEmbed(d)
         self.in_proj = nn.Linear(2, d)   # x_t channel + in-corpus exem channel
         self.temporal = nn.ModuleList(
@@ -146,7 +160,27 @@ class Live2DModel(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def _token_emb(self, names, rig, action_id, training):
+    def _action_emb(self, action_id, action_chars, training):
+        """Action conditioning: ID lookup and/or compositional name encoding."""
+        parts = []
+        if self.action_cond in ("id", "both"):
+            parts.append(self.action_emb(action_id))
+        if self.action_cond in ("name", "both"):
+            if action_chars is None:
+                parts.append(torch.zeros(action_id.shape[0], self.cfg.d_model,
+                                         device=action_id.device))
+            else:
+                parts.append(self.action_name_enc(
+                    action_chars.to(action_id.device), training=training))
+        if not parts:
+            return torch.zeros(action_id.shape[0], self.cfg.d_model,
+                               device=action_id.device)
+        out = parts[0]
+        for p in parts[1:]:
+            out = out + p
+        return out                                                # (B, d)
+
+    def _token_emb(self, names, rig, action_id, action_chars, training):
         B = len(names)
         embs = []
         dev = rig.device
@@ -161,14 +195,15 @@ class Live2DModel(nn.Module):
             n = embs[i].shape[0]
             tok[i, :n] = embs[i]
         rig_e = self.identity_enc(rig).unsqueeze(1)        # (B,1,d) learned identity embedding
-        act_e = self.action_emb(action_id).unsqueeze(1)   # (B,1,d)
+        act_e = self._action_emb(action_id, action_chars, training).unsqueeze(1)  # (B,1,d)
         tok = tok + rig_e + act_e + self.deformer
         return tok  # (B, n_pad, d)
 
-    def forward(self, x_t, t, names, rig, action_id, token_mask, exem, training=True):
+    def forward(self, x_t, t, names, rig, action_id, token_mask, exem, training=True,
+                action_chars=None):
         B, n, T = x_t.shape
         d = self.cfg.d_model
-        tok = self._token_emb(names, rig, action_id, training)        # (B,n,d)
+        tok = self._token_emb(names, rig, action_id, action_chars, training)  # (B,n,d)
         t_e = self.time_emb(t).unsqueeze(1)                           # (B,1,d)
         cond = (tok + t_e).reshape(B * n, 1, d)                      # (Bn, 1, d)
 

@@ -16,6 +16,8 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -72,35 +74,98 @@ def tokenize_name(name: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 4-way identity encoders
 # --------------------------------------------------------------------------- #
-class ParamNameEncoder:
-    """Learned word-piece -> name embedding with dropout (V7.1, unnamed-param fallback)."""
+class ParamNameEncoder(nn.Module):
+    """Learned word-piece -> name embedding with dropout (V7.1).
+
+    MUST subclass nn.Module. As a plain class its parameters were never
+    registered in Live2DModel.parameters(), so the name branch stayed at random
+    initialisation and never trained (found 2026-08-31: the "name" identity
+    signal had been inert for the entire project).
+    """
 
     def __init__(self, word2idx: dict[str, int], d_model: int, dropout: float = 0.2):
-        import torch
-
+        super().__init__()
         self.word2idx = word2idx
         self.dropout = dropout
         self.d_w = 64
         n = len(word2idx)
-        self.emb = torch.nn.Embedding(n, self.d_w, padding_idx=0)
-        self.proj = torch.nn.Linear(self.d_w, d_model)
+        self.emb = nn.Embedding(n, self.d_w, padding_idx=0)
+        self.proj = nn.Linear(self.d_w, d_model)
 
-    def __call__(self, names: list[str], training: bool = True):
-        import torch
-
+    def forward(self, names: list[str], training: bool = True):
+        dev = self.emb.weight.device
         out = []
         for name in names:
             toks = tokenize_name(name)
             idx = [self.word2idx.get(t, 1) for t in toks] or [1]
-            w = self.emb(torch.tensor(idx, dtype=torch.long))
+            w = self.emb(torch.tensor(idx, dtype=torch.long, device=dev))
             v = w.mean(0)                       # mean-pool word pieces
             v = self.proj(v)
             if training and self.dropout > 0 and torch.rand(1).item() < self.dropout:
                 v = torch.zeros_like(v)        # force rig-signature fallback
             out.append(v)
         if not out:
-            return torch.zeros(0, self.proj.out_features)
+            return torch.zeros(0, self.proj.out_features, device=dev)
         return torch.stack(out)                # (n_tokens, d)
+
+
+# --------------------------------------------------------------------------- #
+# P2: compositional action conditioning
+# --------------------------------------------------------------------------- #
+ACTION_SUFFIX_RE = re.compile(r"\.motion3$")
+
+
+def normalize_action_name(a: str) -> str:
+    """Strip the constant `.motion3` suffix so the encoder sees the semantics."""
+    return ACTION_SUFFIX_RE.sub("", a).lower()
+
+
+def build_action_char_vocab(actions) -> dict[str, int]:
+    """Char-level vocab over action names. <pad>=0, <unk>=1."""
+    chars: Counter = Counter()
+    for a in actions:
+        chars.update(normalize_action_name(a))
+    c2i = {"<pad>": 0, "<unk>": 1}
+    for c, _ in chars.most_common(256):
+        c2i.setdefault(c, len(c2i))
+    return c2i
+
+
+def encode_action_name(name: str, c2i: dict[str, int], max_len: int = 32) -> list[int]:
+    s = normalize_action_name(name)
+    return [c2i.get(ch, 1) for ch in s[:max_len]] or [1]
+
+
+class ActionNameEncoder(nn.Module):
+    """Compositional action-name encoder (P2).
+
+    Action names are semantic pinyin (`weixiao`=smile, `shengqi`=angry,
+    `jiandao`/`shitou`/`bu`=rock-paper-scissors, `stand`), so a char-level
+    encoder lets related actions share statistics and generalises to unseen
+    names. This matters because the corpus has only ~4.4 samples per action
+    (1679 actions / 7382 samples), which turns a plain Embedding into a
+    memorisation table that cannot transfer to held-out characters.
+    """
+
+    def __init__(self, char2idx, d_model, max_len: int = 32, dropout: float = 0.0):
+        super().__init__()
+        self.max_len = max_len
+        self.dropout = dropout
+        self.emb = nn.Embedding(len(char2idx), d_model, padding_idx=0)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(d_model), nn.Linear(d_model, d_model),
+            nn.SiLU(), nn.Linear(d_model, d_model))
+
+    def forward(self, name_ids, training: bool = True):
+        """name_ids: (B, L) LongTensor, 0 = pad."""
+        w = self.emb(name_ids)
+        mask = (name_ids != 0).float().unsqueeze(-1)
+        v = (w * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        v = self.proj(v)
+        if training and self.dropout > 0:
+            keep = (torch.rand(v.shape[0], 1, device=v.device) > self.dropout).float()
+            v = v * keep                      # action-condition dropout (CFG prep)
+        return v
 
 
 def rig_signature(model_dir, dim: int = 64) -> np.ndarray:

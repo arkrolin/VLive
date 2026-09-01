@@ -64,4 +64,17 @@ class PipelineConfig:
     gen_mode: str = "ddpm"            # "ddpm" | "regress" (deterministic residual)
     max_diff_t: int = 1000            # sample t in [0, max_diff_t); <1000 truncates
 
+    # ---- action conditioning (P2) ----
+    # "id"   : nn.Embedding(action_vocab, d) - a memorisation table at ~4.4
+    #          samples/action (1679 actions / 7382 samples), but empirically the
+    #          BEST option once the corpus is scaled up.
+    # "name" : compositional char-level encoder over the (semantic pinyin)
+    #          action name. Measured WORSE than "id" at subset=285:
+    #          abs_mae 1.3134 vs 1.1986 (+9.6% error). Mean-pooling over
+    #          characters blurs distinctions between actions that share
+    #          characters. Kept for reference; do not re-try without changing
+    #          the pooling (e.g. learnable / sequence model instead of mean).
+    action_cond: str = "id"           # "id" | "name" | "both"
+    action_name_max_len: int = 32     # chars kept per action name
+
     out_dir: Path = ROOT / "outputs" / "train_runs"

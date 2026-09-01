@@ -178,6 +178,8 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     exem = batch["exem"].to(device)
     rig = batch["rig"].to(device)
     action_id = batch["action_id"].to(device)
+    ac = batch.get("action_chars")
+    action_chars = ac.to(device) if ac is not None else None
     token_mask = batch["token_mask"].to(device)
     names = batch["names"]
     lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi, cfg.max_tokens)
@@ -208,7 +210,8 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
         x_t = q_model.q_sample(x0, t, noise, alphabar)
     # x0-PREDICTION: network regresses clean x0 directly (+ exem prior).
     # loss = masked MSE(x0_hat, x0) in fraction-of-range units == rel_mae^2.
-    x0_hat = model(x_t, t, names, rig, action_id, token_mask, exem_s, training=True)
+    x0_hat = model(x_t, t, names, rig, action_id, token_mask, exem_s, training=True,
+                   action_chars=action_chars)
     se = (x0_hat - x0) ** 2
     aw = torch.from_numpy(
         arm_weight(names, arm_w, n_pad=cfg.max_tokens)).to(device).unsqueeze(-1)
@@ -222,7 +225,8 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
-                 device, steps: int = 50, eta: float = 0.0, t_start: int = None):
+                 device, steps: int = 50, eta: float = 0.0, t_start: int = None,
+                 action_chars=None):
     """x0-prediction DDIM reverse: x0_hat (per-param std units) from x_T.
 
     t_start: highest timestep index to reverse from. Defaults to S-1 (full
@@ -238,7 +242,7 @@ def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar
         t_cur = ts[i]
         t_batch = t_cur.view(1).expand(x.shape[0]).to(device)
         x0_hat = model(x, t_batch, names, rig, action_id, token_mask, exem_s,
-                       training=False)
+                       training=False, action_chars=action_chars)
         x0_hat = x0_hat * token_mask.unsqueeze(-1)
         a_cur = alphabar[t_cur]
         if i == steps - 1:                          # reached t=0 -> x0
@@ -283,6 +287,8 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         target = batch["target"].to(device)
         rig = batch["rig"].to(device)
         action_id = batch["action_id"].to(device)
+        ac = batch.get("action_chars")
+        action_chars = ac.to(device) if ac is not None else None
         token_mask = batch["token_mask"].to(device)
         names = batch["names"]
         B, n, T = target.shape
@@ -298,13 +304,15 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         if getattr(cfg, "gen_mode", "ddpm") == "regress":
             t0 = torch.zeros(B, device=device, dtype=torch.long)
             x0_hat = model(torch.zeros_like(x0), t0, names, rig, action_id,
-                           token_mask, exem_s, training=False)
+                           token_mask, exem_s, training=False,
+                           action_chars=action_chars)
         else:
             x_T = torch.randn(B, n, T, device=device)
             x0_hat = ddim_reverse(
                 model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
                 device, steps=steps,
-                t_start=int(getattr(cfg, "max_diff_t", 1000)))
+                t_start=int(getattr(cfg, "max_diff_t", 1000)),
+                action_chars=action_chars)
         x0_hat = x0_hat.clamp(-0.5, 1.5)
 
         for pred, pre in ((x0_hat, ""), (exem_s, "exem_")):
@@ -345,6 +353,9 @@ def parse_args():
                    help="P1 ablation: ddpm (diffusion) | regress (deterministic residual)")
     p.add_argument("--max_diff_t", type=int, default=None,
                    help="P1 ablation: truncate noise sampling to t < max_diff_t")
+    p.add_argument("--action_cond", type=str, default=None,
+                   choices=["id", "name", "both"],
+                   help="P2 ablation: id (lookup table) | name (compositional) | both")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -373,6 +384,8 @@ def main():
         cfg.gen_mode = args.gen_mode
     if args.max_diff_t is not None:
         cfg.max_diff_t = args.max_diff_t
+    if args.action_cond is not None:
+        cfg.action_cond = args.action_cond
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     device, rank, world_size, ddp = setup_dist()
@@ -389,9 +402,11 @@ def main():
               f"params_vocab={len(train_ds.param2idx)} actions={action_vocab_size} "
               f"val_models={len(val_ds.holdout)}")
         print(f"[rank{rank}] gen_mode={cfg.gen_mode} max_diff_t={cfg.max_diff_t} "
+              f"action_cond={cfg.action_cond} "
               f"eval_shared_min_models={cfg.eval_shared_min_models}")
 
-    model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad)
+    model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad,
+                        train_ds.action_char2idx)
     model.to(device)
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(

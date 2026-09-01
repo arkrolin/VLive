@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from schema import load_whitelist, load_gen_mask, build_vocab  # noqa: E402
+from schema import (load_whitelist, load_gen_mask, build_vocab,              # noqa: E402
+                    build_action_char_vocab, encode_action_name)
 from io_motion import load_target_curves                                       # noqa: E402
 
 
@@ -102,6 +103,11 @@ class Live2DDataset(Dataset):
         # Cached on disk. Consumed by the learnable IdentityEncoder in model.py.
         self.model_ident = build_model_identity(cfg, self.subset, self.targets)
 
+        # P2: char-level vocab over action names, for the compositional action
+        # encoder that replaces the degenerate ID embedding (~4.4 samples per
+        # action makes nn.Embedding a memorisation table).
+        self.action_char2idx = build_action_char_vocab(sorted(self.action2idx))
+
     def __len__(self):
         return len(self.samples)
 
@@ -135,6 +141,8 @@ class Live2DDataset(Dataset):
             "target": target,
             "rig": rig.astype(np.float32),
             "action_id": self.action2idx.get(action, 0),
+            "action_chars": encode_action_name(
+                action, self.action_char2idx, self.cfg.action_name_max_len),
             "exem": exem,
         }
 
@@ -148,6 +156,8 @@ def collate(batch, max_tokens: int):
     rig = np.zeros((B, batch[0]["rig"].shape[0]), np.float32)
     action_id = np.zeros(B, np.int64)
     token_mask = np.zeros((B, max_tokens), np.float32)  # 1 = active
+    max_len = max((len(s.get("action_chars", [1])) for s in batch), default=1)
+    action_chars = np.zeros((B, max_len), np.int64)
     names = []
     for i, s in enumerate(batch):
         n = min(len(s["names"]), max_tokens)
@@ -156,6 +166,8 @@ def collate(batch, max_tokens: int):
         exem[i, :n] = s["exem"][:n]
         rig[i] = s["rig"]
         action_id[i] = s["action_id"]
+        ac = s.get("action_chars", [1])
+        action_chars[i, : len(ac)] = ac
         names.append(s["names"][:n])
     out = {
         "names": names,
@@ -163,6 +175,7 @@ def collate(batch, max_tokens: int):
         "exem": torch.from_numpy(exem),
         "rig": torch.from_numpy(rig),
         "action_id": torch.from_numpy(action_id),
+        "action_chars": torch.from_numpy(action_chars),
         "token_mask": torch.from_numpy(token_mask),
     }
     return out
