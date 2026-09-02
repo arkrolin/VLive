@@ -379,6 +379,19 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--arm_weight", type=float, default=3.0)
+    # --- regularisation / capacity / schedule knobs (overfitting ablation) ---
+    p.add_argument("--dropout", type=float, default=None,
+                   help="transformer block dropout")
+    p.add_argument("--name_dropout", type=float, default=None,
+                   help="per-param name dropout")
+    p.add_argument("--rig_dropout", type=float, default=None,
+                   help="identity condition dropout")
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--lr_min", type=float, default=None, help="cosine LR floor")
+    p.add_argument("--d_model", type=int, default=None, help="transformer width")
+    p.add_argument("--n_layers", type=int, default=None, help="DiT depth")
+    p.add_argument("--patience", type=int, default=None,
+                   help="early-stopping patience (epochs) on val_loss")
     p.add_argument("--fresh", action="store_true",
                    help="ignore existing checkpoint and retrain")
     return p.parse_args()
@@ -405,6 +418,22 @@ def main():
         cfg.max_diff_t = args.max_diff_t
     if args.action_cond is not None:
         cfg.action_cond = args.action_cond
+    if args.dropout is not None:
+        cfg.dropout = args.dropout
+    if args.name_dropout is not None:
+        cfg.name_dropout = args.name_dropout
+    if args.rig_dropout is not None:
+        cfg.rig_dropout = args.rig_dropout
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
+    if args.lr_min is not None:
+        cfg.lr_min = args.lr_min
+    if args.d_model is not None:
+        cfg.d_model = args.d_model
+    if args.n_layers is not None:
+        cfg.n_layers = args.n_layers
+    if args.patience is not None:
+        cfg.early_stop_patience = args.patience
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     device, rank, world_size, ddp = setup_dist()
@@ -423,6 +452,11 @@ def main():
         print(f"[rank{rank}] gen_mode={cfg.gen_mode} max_diff_t={cfg.max_diff_t} "
               f"action_cond={cfg.action_cond} "
               f"eval_shared_min_models={cfg.eval_shared_min_models}")
+        print(f"[rank{rank}] dropout={cfg.dropout} name_dropout={cfg.name_dropout} "
+              f"rig_dropout={cfg.rig_dropout} weight_decay={cfg.weight_decay} "
+              f"lr={cfg.lr} lr_min={cfg.lr_min} d_model={cfg.d_model} "
+              f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
+              f"patience={cfg.early_stop_patience}")
 
     model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad,
                         train_ds.action_char2idx)
