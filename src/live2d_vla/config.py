@@ -48,7 +48,11 @@ class PipelineConfig:
     val_frac: float = 0.12            # hold out this fraction of *models* (whole-character)
     eval_every: int = 10              # epochs between DDIM reconstruction metric
     early_stop_patience: int = 15     # stop if val_loss not improved for N epochs
-    val_recon_batches: int = 16       # cap val reconstruction cost per eval
+    # Cap the reconstruction eval by SAMPLES, not batches: the val loader uses
+    # batch_size=cfg.batch_size, so a batch cap silently changes the evaluated
+    # subset (16x4=64 samples -> exem 2.4405; 16x8=128 -> exem 2.7254), which
+    # makes abs_mae incomparable across runs with different batch sizes.
+    val_recon_samples: int = 64       # val samples scored per reconstruction eval
 
     # ---- honest evaluation (P0) ----
     # Evaluate only on actions shared by >= N models. The deployment task is

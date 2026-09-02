@@ -283,7 +283,7 @@ METRIC_KEYS = ("abs", "rel", "rel_f", "exem_abs", "exem_rel", "exem_rel_f")
 
 @torch.no_grad()
 def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
-                  alphabar, n_batches: int, steps: int = 50):
+                  alphabar, n_samples: int, steps: int = 50):
     """Reconstruction error for the MODEL *and* the EXEM PRIOR on identical batches.
 
     Two relative-error variants are reported because the training loss and the
@@ -300,9 +300,12 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
     min_span = max(g_hi - g_lo, 1.0) * 0.02
     acc = {k: 0.0 for k in METRIC_KEYS}
     cnt = 0
-    for bi, batch in enumerate(loader):
-        if bi >= n_batches:
+    n_seen = 0
+    for _bi, batch in enumerate(loader):
+        # Cap on SAMPLES so the metric does not depend on the loader batch size.
+        if n_seen >= n_samples:
             break
+        n_seen += len(batch["target"])
         target = batch["target"].to(device)
         rig = batch["rig"].to(device)
         action_id = batch["action_id"].to(device)
@@ -352,6 +355,7 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
     model.train()
     out = {k: acc[k] / max(cnt, 1) for k in METRIC_KEYS}
     out["n_params"] = cnt
+    out["n_samples"] = n_seen
     return out
 
 
@@ -392,6 +396,8 @@ def parse_args():
     p.add_argument("--n_layers", type=int, default=None, help="DiT depth")
     p.add_argument("--patience", type=int, default=None,
                    help="early-stopping patience (epochs) on val_loss")
+    p.add_argument("--val_recon_samples", type=int, default=None,
+                   help="val samples scored per reconstruction eval (cap)")
     p.add_argument("--fresh", action="store_true",
                    help="ignore existing checkpoint and retrain")
     return p.parse_args()
@@ -434,6 +440,8 @@ def main():
         cfg.n_layers = args.n_layers
     if args.patience is not None:
         cfg.early_stop_patience = args.patience
+    if args.val_recon_samples is not None:
+        cfg.val_recon_samples = args.val_recon_samples
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     device, rank, world_size, ddp = setup_dist()
@@ -581,7 +589,7 @@ def main():
                 m = recon_metrics(
                     dmodel, val_loader, device, cfg, per_lo, per_hi,
                     g_lo, g_hi, alphabar,
-                    n_batches=cfg.val_recon_batches, steps=50)
+                    n_samples=cfg.val_recon_samples, steps=50)
             dmodel.train()
 
             improved = val_loss < best_val - 1e-4
