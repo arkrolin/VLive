@@ -61,6 +61,14 @@ class PipelineConfig:
     # over characters instead (see _stratified_val_indices in train.py).
     val_recon_per_model: int = 4      # val samples scored per held-out character
     val_recon_seed: int = 1234        # fixed -> the subset is identical every run
+    # Loss weighting by param span. 0 = every param-instance counts the same
+    # (normalised units -> optimises rel_f). p>0 multiplies each instance's
+    # squared error by (span / batch-mean-span) ** p, so p=2 makes the loss
+    # raw-unit MSE, i.e. aligned with abs_mae. Motivated by the w-sweep:
+    # abs_mae wants w~0.75 while rel_f wants w=1.0, i.e. the residual
+    # overshoots on large-range params and the loss never charges it for that.
+    span_w: float = 0.0             # 0 = off (equal weight, legacy)
+    span_w_cap: float = 8.0         # clip the relative span ratio before pow
 
     # ---- honest evaluation (P0) ----
     # Evaluate only on actions shared by >= N models. The deployment task is

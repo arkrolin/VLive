@@ -236,6 +236,14 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     aw = torch.from_numpy(
         arm_weight(names, arm_w, n_pad=cfg.max_tokens)).to(device).unsqueeze(-1)
     valid = token_mask.unsqueeze(-1) * aw
+    if getattr(cfg, "span_w", 0.0) > 0:
+        # Span-weighted loss: (span / batch-mean-span) ** span_w, clipped so a
+        # few extreme-range params cannot monopolise the gradient. span_w=2
+        # makes this raw-unit MSE, i.e. the loss then optimises abs_mae.
+        ref = span_t[token_mask > 0.5].mean().clamp(min=1e-6)
+        cap = float(getattr(cfg, "span_w_cap", 8.0))
+        ratio = (span_t / ref).clamp(1.0 / cap, cap)
+        valid = valid * ratio.pow(float(cfg.span_w)).unsqueeze(-1)
     loss = (se * valid).sum() / valid.sum().clamp(min=1.0)
     return loss
 
@@ -285,7 +293,7 @@ METRIC_KEYS = ("abs", "rel", "rel_f", "exem_abs", "exem_rel", "exem_rel_f")
 @torch.no_grad()
 def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
                   alphabar, n_samples: int, steps: int = 50,
-                  collect: dict | None = None):
+                  collect: dict | None = None, residual_scale: float = 1.0):
     """Reconstruction error for the MODEL *and* the EXEM PRIOR on identical batches.
 
     Two relative-error variants are reported because the training loss and the
@@ -297,6 +305,11 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
     The exem prior is scored on the same batches, so any model can be compared
     directly against "just output the action mean" - which is the comparison
     that actually matters.
+
+    ``residual_scale`` (w) rewrites the prediction as ``exem + w * residual``.
+    w=1 is the trained model; w<1 shrinks toward the exem prior. Used offline
+    (outputs/eval_ckpt.py --residual_scale) to map the abs_mae / rel_f
+    trade-off without retraining.
 
     If ``collect`` is a dict, the per-param-instance errors are appended to
     ``collect["abs"]`` / ``collect["exem_abs"]`` (aligned element-wise, in
@@ -343,6 +356,8 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
                 device, steps=steps,
                 t_start=int(getattr(cfg, "max_diff_t", 1000)),
                 action_chars=action_chars)
+        if residual_scale != 1.0:
+            x0_hat = exem_s + residual_scale * (x0_hat - exem_s)
         x0_hat = x0_hat.clamp(-0.5, 1.5)
 
         for pred, pre in ((x0_hat, ""), (exem_s, "exem_")):
@@ -424,6 +439,12 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--lr_min", type=float, default=None, help="cosine LR floor")
     p.add_argument("--d_model", type=int, default=None, help="transformer width")
+    p.add_argument("--span_w", type=float, default=None,
+                   help="weight each param-instance loss by "
+                        "(span/mean_span)**span_w; 0 = equal weight (legacy), "
+                        "2 = raw-unit MSE (matches abs_mae)")
+    p.add_argument("--span_w_cap", type=float, default=None,
+                   help="clip the relative span ratio to [1/cap, cap] before pow")
     p.add_argument("--n_layers", type=int, default=None, help="DiT depth")
     p.add_argument("--patience", type=int, default=None,
                    help="early-stopping patience (epochs) on val_loss")
@@ -467,6 +488,10 @@ def main():
         cfg.lr_min = args.lr_min
     if args.d_model is not None:
         cfg.d_model = args.d_model
+    if args.span_w is not None:
+        cfg.span_w = args.span_w
+    if args.span_w_cap is not None:
+        cfg.span_w_cap = args.span_w_cap
     if args.n_layers is not None:
         cfg.n_layers = args.n_layers
     if args.patience is not None:
@@ -494,6 +519,7 @@ def main():
         print(f"[rank{rank}] dropout={cfg.dropout} name_dropout={cfg.name_dropout} "
               f"rig_dropout={cfg.rig_dropout} weight_decay={cfg.weight_decay} "
               f"lr={cfg.lr} lr_min={cfg.lr_min} d_model={cfg.d_model} "
+              f"span_w={cfg.span_w} span_w_cap={cfg.span_w_cap} "
               f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
               f"patience={cfg.early_stop_patience}")
 

@@ -17,6 +17,11 @@ Usage
     # choose GPU (default: cuda:0)
     .venv/bin/python outputs/eval_ckpt.py ... --device cuda:5
 
+    # residual-scale sweep: load the checkpoint ONCE, score it at every w.
+    # x0_hat = exem + w * residual. w=1 is the trained model, w=0 is the prior.
+    .venv/bin/python outputs/eval_ckpt.py abl_H_regress285_ep45 \
+        --sweep 0.0,0.25,0.5,0.75,1.0,1.25
+
 Notes
 -----
 * Uses ``ckpt_best.pt`` (selected on val_loss) unless ``--ckpt latest`` is given.
@@ -63,8 +68,14 @@ def get_corpus(cfg):
     return _CACHE[key]
 
 
-def evaluate(run: str, device: torch.device, n_samples: int,
-             which: str = "best", stratified: int = 0, dump: str = "") -> dict:
+def load_ctx(run: str, device: torch.device, n_samples: int,
+             which: str = "best", stratified: int = 0) -> dict:
+    """Build everything needed to score one checkpoint.
+
+    Split out from :func:`evaluate` so a residual-scale sweep can pay the
+    expensive part (corpus construction + model load) exactly once and then
+    call ``recon_metrics`` repeatedly with different w.
+    """
     ckpt_path = RUNS / run / f"ckpt_{which}.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(ckpt_path)
@@ -109,13 +120,31 @@ def evaluate(run: str, device: torch.device, n_samples: int,
             val_ds, batch_size=4, sampler=SequentialSampler(val_ds),
             collate_fn=lambda b: collate(b, cfg.max_tokens), num_workers=0)
         cap = n_samples if n_samples > 0 else len(val_ds)
+    return dict(run=run, device=device, model=model, cfg=cfg, loader=loader,
+                cap=cap, per_lo=per_lo, per_hi=per_hi, g_lo=g_lo, g_hi=g_hi,
+                alphabar=alphabar, sd=sd)
+
+
+def evaluate(ctx: dict, residual_scale: float = 1.0) -> dict:
+    """Score one already-loaded checkpoint.
+
+    ``residual_scale`` (w) rewrites the prediction as ``exem + w * residual``:
+    w=1 is the trained model, w=0 is the exem prior, w<1 shrinks toward the
+    prior. Sweeping it maps the abs_mae / rel_f trade-off with no retraining.
+    Safe to call repeatedly - ``recon_metrics`` re-enters eval mode itself.
+    """
+    run = ctx["run"]
     collect: dict = {}
     with torch.no_grad():
-        m = recon_metrics(model, loader, device, cfg, per_lo, per_hi,
-                          g_lo, g_hi, alphabar, n_samples=cap, steps=50,
-                          collect=collect)
+        m = recon_metrics(ctx["model"], ctx["loader"], ctx["device"], ctx["cfg"],
+                          ctx["per_lo"], ctx["per_hi"], ctx["g_lo"], ctx["g_hi"],
+                          ctx["alphabar"], n_samples=ctx["cap"], steps=50,
+                          collect=collect, residual_scale=residual_scale)
+    sd = ctx["sd"]
     return {
-        "run": run,
+        "run": run if residual_scale == 1.0 else f"{run}@w{residual_scale:g}",
+        "base": run,
+        "w": residual_scale,
         "epoch": sd.get("epoch"),
         "val_loss": sd.get("val_loss"),
         "n_samples": m.get("n_samples"),
@@ -171,27 +200,38 @@ def main() -> int:
     ap.add_argument("--dump", type=str, default="",
                     help="dir to save per-param-instance errors (.npz) for later "
                          "paired comparison across separately-scored runs")
+    ap.add_argument("--residual_scale", type=float, default=1.0,
+                    help="rewrite the prediction as exem + w*residual; "
+                         "w=1 is the trained model, w=0 is the exem prior")
+    ap.add_argument("--sweep", type=str, default="",
+                    help="comma-separated w values; loads each checkpoint ONCE and "
+                         "scores it at every w (cheap trade-off curve, no retraining)")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    sweeps = [float(x) for x in args.sweep.split(",") if x.strip()] if args.sweep else []
     res = []
     for r in args.runs:
-        one = evaluate(r, device, args.n_samples, args.ckpt, args.stratified)
-        if args.dump:
-            dump_errors(one, args.dump)
-        res.append(one)
+        ctx = load_ctx(r, device, args.n_samples, args.ckpt, args.stratified)
+        for w in (sweeps if sweeps else [args.residual_scale]):
+            one = evaluate(ctx, w)
+            if args.dump:
+                dump_errors(one, args.dump)
+            res.append(one)
 
     n = res[0]["n_samples"]
     print(f"\n=== offline eval | val samples scored: {n} | ckpt_{args.ckpt}.pt ===")
-    print(f"{'run':<28}{'ep':>4}{'abs_mae':>10}{'exem_abs':>10}{'vs exem':>10}"
+    print(f"{'run':<32}{'w':>6}{'ep':>4}{'abs_mae':>10}{'exem_abs':>10}{'vs exem':>10}"
           f"{'rel_f':>9}{'exem_rel_f':>12}{'n_inst':>9}")
-    print("-" * 88)
-    for r in sorted(res, key=lambda x: x["abs"]):
+    print("-" * 98)
+    # sweeping -> group by run and order by w; comparing runs -> rank by abs_mae
+    order = (lambda x: (x["base"], x["w"])) if sweeps else (lambda x: x["abs"])
+    for r in sorted(res, key=order):
         exem = r["exem_abs"]
         gain = (exem - r["abs"]) / exem * 100 if exem else float("nan")
-        print(f"{r['run']:<28}{r['epoch']:>4}{r['abs']:>10.4f}{exem:>10.4f}"
-              f"{gain:>9.1f}%{r['rel_f']:>9.4f}{r['exem_rel_f']:>12.4f}"
-              f"{len(r['err']):>9}")
+        print(f"{r['run']:<32}{r['w']:>6.2f}{r['epoch']:>4}{r['abs']:>10.4f}"
+              f"{exem:>10.4f}{gain:>9.1f}%{r['rel_f']:>9.4f}"
+              f"{r['exem_rel_f']:>12.4f}{len(r['err']):>9}")
 
     if len(res) > 1:
         print("\n=== paired comparisons (positive = first row is WORSE) ===")
@@ -201,7 +241,7 @@ def main() -> int:
                 continue
             mean, se, t = paired(r, base, "err")
             verdict = "significant" if abs(t) > 1.96 else "not significant"
-            print(f"{r['run']:<28} - {base['run']:<28} "
+            print(f"{r['run']:<32} - {base['run']:<32} "
                   f"diff={mean:+.4f}  se={se:.4f}  t={t:+.2f}  ({verdict})")
     return 0
 
