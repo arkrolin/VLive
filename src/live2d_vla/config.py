@@ -53,6 +53,14 @@ class PipelineConfig:
     # subset (16x4=64 samples -> exem 2.4405; 16x8=128 -> exem 2.7254), which
     # makes abs_mae incomparable across runs with different batch sizes.
     val_recon_samples: int = 64       # val samples scored per reconstruction eval
+    # The val set is ordered by character, so a contiguous prefix of N samples
+    # covers only a few held-out characters (the first 64 of 561 come from just
+    # 5 of 34 models, and those 5 are ~1.8x harder than average: exem prior
+    # abs_mae 2.4405 there vs ~1.345 over all 561). Any metric taken on that
+    # prefix describes 5 characters, not 34. Sample the eval subset STRATIFIED
+    # over characters instead (see _stratified_val_indices in train.py).
+    val_recon_per_model: int = 4      # val samples scored per held-out character
+    val_recon_seed: int = 1234        # fixed -> the subset is identical every run
 
     # ---- honest evaluation (P0) ----
     # Evaluate only on actions shared by >= N models. The deployment task is

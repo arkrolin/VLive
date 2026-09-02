@@ -54,6 +54,7 @@ import argparse
 import csv
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -67,7 +68,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset
 
 from config import PipelineConfig
 from dataset import Live2DDataset, collate
@@ -283,7 +284,8 @@ METRIC_KEYS = ("abs", "rel", "rel_f", "exem_abs", "exem_rel", "exem_rel_f")
 
 @torch.no_grad()
 def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
-                  alphabar, n_samples: int, steps: int = 50):
+                  alphabar, n_samples: int, steps: int = 50,
+                  collect: dict | None = None):
     """Reconstruction error for the MODEL *and* the EXEM PRIOR on identical batches.
 
     Two relative-error variants are reported because the training loss and the
@@ -295,6 +297,12 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
     The exem prior is scored on the same batches, so any model can be compared
     directly against "just output the action mean" - which is the comparison
     that actually matters.
+
+    If ``collect`` is a dict, the per-param-instance errors are appended to
+    ``collect["abs"]`` / ``collect["exem_abs"]`` (aligned element-wise, in
+    iteration order) instead of only being averaged. Two runs over the same val
+    subset then yield PAIRED vectors, so their difference can be tested far more
+    precisely than either mean.
     """
     model.eval()
     min_span = max(g_hi - g_lo, 1.0) * 0.02
@@ -350,6 +358,9 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
                     acc[pre + "abs"] += e_abs
                     acc[pre + "rel_f"] += min(e_f, 2.0)
                     acc[pre + "rel"] += min(e_abs / sp_raw, 2.0)
+                    if collect is not None:
+                        collect.setdefault(pre + "abs", []).append(e_abs)
+                        collect.setdefault(pre + "rel_f", []).append(min(e_f, 2.0))
                     if pre == "":
                         cnt += 1
     model.train()
@@ -357,6 +368,26 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
     out["n_params"] = cnt
     out["n_samples"] = n_seen
     return out
+
+
+def _stratified_val_indices(val_ds, per_model: int, seed: int) -> list[int]:
+    """Pick up to `per_model` val samples per held-out character.
+
+    The val set is ordered by character, so a contiguous prefix evaluates only a
+    few characters (first 64 of 561 -> 5 of 34 models). Stratifying guarantees
+    every held-out character is represented, which matters because character
+    level variance dominates this metric.
+    """
+    by_model: dict[str, list[int]] = {}
+    for i, (m, _a) in enumerate(val_ds.samples):
+        by_model.setdefault(m, []).append(i)
+    rng = random.Random(seed)
+    idx: list[int] = []
+    for m in sorted(by_model):
+        pool = list(by_model[m])
+        rng.shuffle(pool)
+        idx.extend(pool[:per_model])
+    return sorted(idx)
 
 
 # --------------------------------------------------------------------------- #
@@ -527,6 +558,19 @@ def main():
                         "exem_abs_mae", "exem_rel_mae", "exem_rel_mae_f",
                         "lr", "best"])
 
+    # Reconstruction-eval subset: stratified over held-out characters so the
+    # metric reflects all of them instead of the first few in dataset order.
+    eval_idx = _stratified_val_indices(val_ds, max(1, cfg.val_recon_per_model),
+                                       cfg.val_recon_seed)
+    eval_loader = DataLoader(
+        Subset(val_ds, eval_idx), batch_size=cfg.batch_size,
+        sampler=SequentialSampler(eval_idx),
+        collate_fn=lambda b: collate(b, cfg.max_tokens), num_workers=0)
+    if is_main(rank):
+        print(f"[rank{rank}] recon eval subset={len(eval_idx)} samples "
+              f"({cfg.val_recon_per_model}/character, stratified) "
+              f"val_loss uses all {len(val_ds)}")
+
     best_val, epochs_no_improve = float("inf"), 0
     global_step = start_epoch * steps_per_epoch
     nan_m = {k: float("nan") for k in METRIC_KEYS}
@@ -587,9 +631,9 @@ def main():
             val_loss = v_sum / max(v_cnt, 1)
             if epoch + 1 >= cfg.eval_every or epoch == cfg.epochs - 1:
                 m = recon_metrics(
-                    dmodel, val_loader, device, cfg, per_lo, per_hi,
+                    dmodel, eval_loader, device, cfg, per_lo, per_hi,
                     g_lo, g_hi, alphabar,
-                    n_samples=cfg.val_recon_samples, steps=50)
+                    n_samples=len(eval_idx), steps=50)
             dmodel.train()
 
             improved = val_loss < best_val - 1e-4
