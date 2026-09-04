@@ -123,7 +123,7 @@ class TokenMixBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 class Live2DModel(nn.Module):
     def __init__(self, cfg, word2idx, action_vocab_size, n_tokens_pad,
-                 action_char2idx=None):
+                 action_char2idx=None, param2idx=None):
         super().__init__()
         d = cfg.d_model
         self.cfg = cfg
@@ -159,6 +159,39 @@ class Live2DModel(nn.Module):
         # zero-init head: x0_hat = exem (the prior) at init -> loss starts at floor
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+        # ---- learnable residual gate (V8.2) ----
+        # g = sigmoid(bias + Emb(param_name)) applied to the residual, so the
+        # model can learn to fall back to the exem prior per param KIND. The
+        # gate reads only the static param name (never the instance's residual)
+        # so it cannot collapse into "always predict nothing". bias=4 -> g~0.98
+        # at init, i.e. it starts as an exact no-op on the ungated model.
+        self.residual_gate = getattr(cfg, "residual_gate", "none")
+        if self.residual_gate == "name":
+            if param2idx is None:
+                raise ValueError("residual_gate='name' requires param2idx")
+            # plain dict is NOT a module attribute -> it is not a parameter and
+            # is not touched by .to(); safe to store (unlike an nn.Embedding,
+            # which MUST be assigned on an nn.Module - see the ParamNameEncoder
+            # bug: a plain class holding an Embedding never reached the optimiser).
+            self.param2idx = dict(param2idx)
+            self.gate_emb = nn.Embedding(len(self.param2idx), 1)
+            nn.init.zeros_(self.gate_emb.weight)
+            self.gate_bias = nn.Parameter(torch.tensor(4.0))
+        else:
+            self.gate_emb = None
+
+    def _gate_ids(self, names, device):
+        """(B, n_pad) LongTensor of param-name ids for the residual gate."""
+        B = len(names)
+        n = self.n_tokens_pad
+        gi = torch.zeros(B, n, dtype=torch.long, device=device)
+        get = self.param2idx.get
+        for i in range(B):
+            for j, nm in enumerate(names[i]):
+                if j >= n:
+                    break
+                gi[i, j] = get(nm, 1)
+        return gi
 
     def _action_emb(self, action_id, action_chars, training):
         """Action conditioning: ID lookup and/or compositional name encoding."""
@@ -220,7 +253,12 @@ class Live2DModel(nn.Module):
             h = blk(h, m)
         h = h.reshape(B, T, n, d).permute(0, 2, 1, 3)                # (B,n,T,d)
         out = self.head(h).squeeze(-1)                               # (B,n,T)
-        out = exem + out                                            # x0_hat = prior(exem) + residual
+        if self.gate_emb is not None:
+            g = torch.sigmoid(
+                self.gate_bias + self.gate_emb(self._gate_ids(names, out.device)))
+            out = exem + g * out        # x0_hat = prior(exem) + g * residual
+        else:
+            out = exem + out                                        # x0_hat = prior(exem) + residual
         return out * token_mask.unsqueeze(-1)
 
     # --------------------------- DDPM --------------------------- #

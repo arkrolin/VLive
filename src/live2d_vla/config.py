@@ -97,4 +97,39 @@ class PipelineConfig:
     action_cond: str = "id"           # "id" | "name" | "both"
     action_name_max_len: int = 32     # chars kept per action name
 
+    # ---- learnable residual gate (V8.2) ----
+    # x0_hat = exem + g * residual, g = sigmoid(bias + Emb(param_name)[name]).
+    #
+    # Motivation (diag_error_floor.py): an ORACLE gate that picks model-vs-prior
+    # per param-instance scores abs_mae 0.7914, i.e. 37% below the best model,
+    # so "learning when NOT to apply the residual" is the highest ceiling left.
+    # The largest measured defect is systematic overshoot on the top span
+    # decile (that bucket alone is -103%); param NAME correlates with span, so a
+    # single lookup table can express most of that.
+    #
+    # The gate sees ONLY the static param name - never the instance's residual -
+    # so it cannot collapse into "predict nothing" per sample; it can only learn
+    # "params of this kind should be shrunk". Init bias=4 -> g~0.98 (a no-op),
+    # so a gated run starts from the ungated model's behaviour.
+    residual_gate: str = "none"       # "none" | "name"
+
+    # ---- checkpoint selection (V8.2) ----
+    # WHICH score decides `ckpt_best.pt` / early stopping.
+    # "val_loss" is the legacy choice and is WRONG: measured on abl_K_span1 the
+    # val_loss-selected checkpoint (ep32) scores abs_mae 1.3654 on the full val
+    # set while the LAST epoch (ep45) scores 1.1401 - a 20% swing in the very
+    # metric the gate is written against. span-weighted losses make val_loss and
+    # abs_mae diverge even harder, so selection must follow the target metric.
+    select_metric: str = "val_loss"   # "val_loss" | "abs" | "rel_f"
+
+    # ---- per-param range statistics (see outputs/_patch_range_fix.py) ----
+    # None = scan the whole train corpus (one pass, ~3.5 min, cached to
+    # outputs/range_cache_*.pkl). 400 = the old behaviour, which covered only
+    # 29/251 train characters and handed 14.9% of val instances a 1130-wide
+    # span (665x their true median span) -> 88% of abs_mae's weighting.
+    range_stats_n: int = None
+    # Span given to params still absent from the stats: the q-quantile of the
+    # per-param span distribution. <0 restores the legacy global range.
+    fb_span_q: float = 0.5
+
     out_dir: Path = ROOT / "outputs" / "train_runs"

@@ -143,12 +143,54 @@ def arm_weight(names_b, weight: float = 3.0, n_pad: int = None) -> np.ndarray:
     return w
 
 
+def _range_cache_path(cfg, n_req, n_samples):
+    """Disk cache for the one-off full-corpus range scan (atomic, parallel-safe)."""
+    if cfg is None:
+        return None
+    subset = int(getattr(cfg, "subset_models", 0))
+    tag = "all" if n_req is None else str(int(n_req))
+    return (ROOT / "outputs"
+            / f"range_cache_{subset}_{tag}_{n_samples}.pkl")
+
+
+def _fallback_span(cfg, per_lo, per_hi, g_lo, g_hi):
+    """Span used for params ABSENT from the stats.
+
+    Historically this was the GLOBAL range (g_hi - g_lo = 1130.2 here), which is
+    ~665x the true median span of the params it was applied to, and (a) handed
+    them ~88% of abs_mae's weighting and (b) shrank their normalised error to
+    ~0.004 so the model got no gradient on them. Default is now the MEDIAN
+    per-param span; cfg.fb_span_q < 0 restores the legacy global range.
+    """
+    q = getattr(cfg, "fb_span_q", 0.5)
+    if q is None or float(q) < 0 or not per_lo:
+        return float(max(g_hi - g_lo, 1.0))
+    spans = np.array([per_hi[p] - per_lo[p] for p in per_lo], dtype=np.float64)
+    return float(np.quantile(spans, float(q)))
+
+
 def compute_range(ds, n: int = None):
     """Per-param (lo, hi) over the TRAIN corpus (one-time).
 
-    Returns (g_lo, g_hi, per_lo, per_hi). per_* are dicts keyed by param name;
-    g_lo/g_hi are global fallbacks for params unseen in the stats.
+    Returns (g_lo, g_hi, per_lo, per_hi, fb_span). per_* are dicts keyed by
+    param name; fb_span is the span given to params unseen in the stats
+    (median per-param span, NOT the global range - see _fallback_span).
     """
+    import pickle as _pk
+
+    cfg = getattr(ds, "cfg", None)
+    n_req = None if n is None else int(n)
+    cache = _range_cache_path(cfg, n_req, len(ds))
+    if cache is not None and cache.exists():
+        try:
+            blob = _pk.loads(cache.read_bytes())
+            print(f"[range stats] loaded {cache.name} "
+                  f"({len(blob['per_lo'])} params)", flush=True)
+            return (blob["g_lo"], blob["g_hi"], blob["per_lo"],
+                    blob["per_hi"], blob["fb_span"])
+        except Exception as exc:
+            print(f"[range stats] cache unreadable ({exc}) - recomputing",
+                  flush=True)
     per_lo, per_hi = {}, {}
     if n is None:
         n = len(ds)
@@ -173,14 +215,36 @@ def compute_range(ds, n: int = None):
                 per_hi[nm] = max(per_hi[nm], hi)
     g_lo = min(per_lo.values()) if per_lo else 0.0
     g_hi = max(per_hi.values()) if per_hi else 1.0
-    return g_lo, g_hi, per_lo, per_hi
+    fb_span = _fallback_span(cfg, per_lo, per_hi, g_lo, g_hi)
+    if cache is not None:
+        try:
+            import os as _os
+
+            tmp = cache.with_suffix('.tmp')
+            tmp.write_bytes(_pk.dumps({'g_lo': g_lo, 'g_hi': g_hi,
+                                       'per_lo': per_lo, 'per_hi': per_hi,
+                                       'fb_span': fb_span}))
+            _os.replace(tmp, cache)      # atomic -> safe under parallel launches
+            print(f'[range stats] cached {cache.name} '
+                  f'({len(per_lo)} params, fallback span {fb_span:.4f})',
+                  flush=True)
+        except Exception as exc:
+            print(f'[range stats] cache write failed ({exc})', flush=True)
+    return g_lo, g_hi, per_lo, per_hi, fb_span
 
 
-def mean_range_vecs(names_b, per_lo, per_hi, g_lo, g_hi, max_tokens):
-    """(B, max_tokens) lo/hi arrays aligned to token rows (for range norm)."""
+def mean_range_vecs(names_b, per_lo, per_hi, g_lo, g_hi, max_tokens,
+                    fb_span=None):
+    """(B, max_tokens) lo/hi arrays aligned to token rows (for range norm).
+
+    fb_span: span handed to params ABSENT from per_lo/per_hi. None (legacy)
+    fills with the global range (g_lo, g_hi); a float fills (0, fb_span).
+    """
     B = len(names_b)
-    lo_v = np.full((B, max_tokens), g_lo, np.float32)
-    hi_v = np.full((B, max_tokens), g_hi, np.float32)
+    fill_lo, fill_hi = (0.0, float(fb_span)) if fb_span is not None \
+        else (g_lo, g_hi)
+    lo_v = np.full((B, max_tokens), fill_lo, np.float32)
+    hi_v = np.full((B, max_tokens), fill_hi, np.float32)
     for i, names in enumerate(names_b):
         for j, nm in enumerate(names):
             if j >= max_tokens:
@@ -202,7 +266,9 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     action_chars = ac.to(device) if ac is not None else None
     token_mask = batch["token_mask"].to(device)
     names = batch["names"]
-    lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi, cfg.max_tokens)
+    lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi,
+        cfg.max_tokens,
+        fb_span=getattr(cfg, 'fb_span', None))
     lo_t = torch.from_numpy(lo_v).to(device)
     hi_t = torch.from_numpy(hi_v).to(device)
     # robust span: floor near-constant params at 2% of the global range so they
@@ -335,7 +401,9 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         token_mask = batch["token_mask"].to(device)
         names = batch["names"]
         B, n, T = target.shape
-        lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi, cfg.max_tokens)
+        lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi,
+            cfg.max_tokens,
+            fb_span=getattr(cfg, 'fb_span', None))
         lo_t = torch.from_numpy(lo_v).to(device)
         hi_t = torch.from_numpy(hi_v).to(device)
         span_t = (hi_t - lo_t).clamp(min=min_span)      # loss-aligned span
@@ -439,6 +507,14 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--lr_min", type=float, default=None, help="cosine LR floor")
     p.add_argument("--d_model", type=int, default=None, help="transformer width")
+    p.add_argument("--range_stats_n", type=int, default=None,
+                   help="samples scanned for the per-param range stats; "
+                        "None/-1 = whole train corpus (fixed), 400 = legacy"
+                        " (covers only 29/251 characters)")
+    p.add_argument("--fb_span_q", type=float, default=None,
+                   help="quantile of the per-param span distribution used "
+                        "for params absent from the stats; <0 = legacy "
+                        "global range")
     p.add_argument("--span_w", type=float, default=None,
                    help="weight each param-instance loss by "
                         "(span/mean_span)**span_w; 0 = equal weight (legacy), "
@@ -450,6 +526,16 @@ def parse_args():
                    help="early-stopping patience (epochs) on val_loss")
     p.add_argument("--val_recon_samples", type=int, default=None,
                    help="val samples scored per reconstruction eval (cap)")
+    p.add_argument("--residual_gate", type=str, default=None,
+                   choices=["none", "name"],
+                   help="learnable per-param-name gate g on the residual: "
+                        "x0_hat = exem + g * residual")
+    p.add_argument("--select_metric", type=str, default=None,
+                   choices=["val_loss", "abs", "rel_f"],
+                   help="score that decides ckpt_best.pt and early stopping. "
+                        "'val_loss' is the legacy choice and is misaligned with "
+                        "the gate: on abl_K_span1 it picks ep32 (abs 1.3654) "
+                        "over ep45 (abs 1.1401). Forces eval_every=1.")
     p.add_argument("--fresh", action="store_true",
                    help="ignore existing checkpoint and retrain")
     return p.parse_args()
@@ -490,6 +576,11 @@ def main():
         cfg.d_model = args.d_model
     if args.span_w is not None:
         cfg.span_w = args.span_w
+    if args.range_stats_n is not None:
+        cfg.range_stats_n = (None if args.range_stats_n < 0
+                             else args.range_stats_n)
+    if args.fb_span_q is not None:
+        cfg.fb_span_q = args.fb_span_q
     if args.span_w_cap is not None:
         cfg.span_w_cap = args.span_w_cap
     if args.n_layers is not None:
@@ -498,6 +589,14 @@ def main():
         cfg.early_stop_patience = args.patience
     if args.val_recon_samples is not None:
         cfg.val_recon_samples = args.val_recon_samples
+    if args.residual_gate is not None:
+        cfg.residual_gate = args.residual_gate
+    if args.select_metric is not None:
+        cfg.select_metric = args.select_metric
+    if cfg.select_metric != "val_loss":
+        # the selection score is only computed by recon_metrics, so it has to
+        # run every epoch; otherwise ckpt_best would silently stay at epoch 1.
+        cfg.eval_every = 1
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     device, rank, world_size, ddp = setup_dist()
@@ -520,11 +619,14 @@ def main():
               f"rig_dropout={cfg.rig_dropout} weight_decay={cfg.weight_decay} "
               f"lr={cfg.lr} lr_min={cfg.lr_min} d_model={cfg.d_model} "
               f"span_w={cfg.span_w} span_w_cap={cfg.span_w_cap} "
+              f"range_stats_n={cfg.range_stats_n} fb_span_q={cfg.fb_span_q} "
               f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
-              f"patience={cfg.early_stop_patience}")
+              f"patience={cfg.early_stop_patience} "
+              f"residual_gate={cfg.residual_gate} select_metric={cfg.select_metric}")
 
     model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad,
-                        train_ds.action_char2idx)
+                        train_ds.action_char2idx,
+                        getattr(train_ds, "param2idx", None))
     model.to(device)
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -534,7 +636,11 @@ def main():
         dmodel = model
 
     # ---- per-param RANGE stats (TRAIN only, no leakage) ----
-    g_lo, g_hi, per_lo, per_hi = compute_range(train_ds, n=400)
+    # Full-corpus range stats. n=400 covered only 29/251 train characters,
+    # so 14.9% of val param-instances silently got the 1130-wide global range.
+    g_lo, g_hi, per_lo, per_hi, fb_span = compute_range(
+        train_ds, n=getattr(cfg, 'range_stats_n', None))
+    cfg.fb_span = fb_span      # travels with the checkpoint via cfg.__dict__
     if is_main(rank):
         print(f"[rank{rank}] global range=({g_lo:.3f},{g_hi:.3f}) "
               f"per-param entries={len(per_lo)}")
@@ -582,7 +688,7 @@ def main():
             w.writerow(["epoch", "train_loss", "val_loss",
                         "val_abs_mae", "val_rel_mae", "val_rel_mae_f",
                         "exem_abs_mae", "exem_rel_mae", "exem_rel_mae_f",
-                        "lr", "best"])
+                        "lr", "best", "sel"])
 
     # Reconstruction-eval subset: stratified over held-out characters so the
     # metric reflects all of them instead of the first few in dataset order.
@@ -598,6 +704,9 @@ def main():
               f"val_loss uses all {len(val_ds)}")
 
     best_val, epochs_no_improve = float("inf"), 0
+    # val_loss is still tracked (it is the legacy `best` column) but the score
+    # that actually drives ckpt_best.pt / early stopping is `select_metric`.
+    best_sel, best_val_loss = float("inf"), float("inf")
     global_step = start_epoch * steps_per_epoch
     nan_m = {k: float("nan") for k in METRIC_KEYS}
     best_m = dict(nan_m)
@@ -662,15 +771,22 @@ def main():
                     n_samples=len(eval_idx), steps=50)
             dmodel.train()
 
-            improved = val_loss < best_val - 1e-4
+            if cfg.select_metric == "val_loss":
+                sel = val_loss
+            else:
+                sel = m.get(cfg.select_metric, float("nan"))
+            improved = (not math.isnan(sel)) and sel < best_sel - 1e-6
+            best_val_loss = min(best_val_loss, val_loss)
             if improved:
-                best_val = val_loss
+                best_sel = sel
+                best_val = sel
                 best_m = m
                 epochs_no_improve = 0
                 torch.save({
                     "model": dmodel.state_dict(), "optim": optimizer.state_dict(),
                     "epoch": epoch + 1, "g_lo": g_lo, "g_hi": g_hi,
                     "cfg": cfg.__dict__, "val_loss": val_loss,
+                    "select_metric": cfg.select_metric, "select_score": float(sel),
                 }, cfg.out_dir / "ckpt_best.pt")
             else:
                 epochs_no_improve += 1
@@ -681,12 +797,13 @@ def main():
                             f"{m['abs']:.4f}", f"{m['rel']:.4f}", f"{m['rel_f']:.4f}",
                             f"{m['exem_abs']:.4f}", f"{m['exem_rel']:.4f}",
                             f"{m['exem_rel_f']:.4f}", f"{lr:.2e}",
-                            f"{best_val:.4f}"])
+                            f"{best_val_loss:.4f}", f"{best_sel:.4f}"])
             print(f"[rank{rank}] ep {epoch + 1} train={train_loss:.4f} "
-                  f"val={val_loss:.4f} (best {best_val:.4f}) "
+                  f"val={val_loss:.4f} (best {best_val_loss:.4f}) "
                   f"rel_f={m['rel_f']:.4f} exem_rel_f={m['exem_rel_f']:.4f} | "
                   f"abs={m['abs']:.3f} exem_abs={m['exem_abs']:.3f} "
                   f"gap={val_loss / max(train_loss,1e-6):.2f}x "
+                  f"sel[{cfg.select_metric}]={sel:.4f} (best {best_sel:.4f}) "
                   f"noimp={epochs_no_improve}")
 
         # ---- checkpoint latest ----
@@ -703,8 +820,8 @@ def main():
         # ---- early stopping ----
         stop = False
         if is_main(rank) and epochs_no_improve >= cfg.early_stop_patience:
-            print(f"[rank{rank}] early stop: val_loss not improved for "
-                  f"{epochs_no_improve} epochs")
+            print(f"[rank{rank}] early stop: {cfg.select_metric} not improved "
+                  f"for {epochs_no_improve} epochs")
             stop = True
         if ddp:
             stop_flag = torch.tensor([1 if stop else 0], device=device)
