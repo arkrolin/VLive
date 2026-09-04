@@ -54,7 +54,12 @@ RUNS = ROOT / "outputs" / "train_runs"
 # later arm's abs_mae by ~6%. Safer default: one process per checkpoint.
 _CORPUS_KEYS = ("subset_models", "T", "fps", "k_exemplars", "max_tokens",
                 "val_frac", "seed", "eval_shared_min_models", "action_cond",
-                "action_name_max_len")
+                "action_name_max_len",
+                # The range statistics decide each param's NORMALISATION, so two
+                # runs that differ here must never share a cached corpus:
+                # reusing a full-corpus (g_lo, per_lo, ...) for a legacy run
+                # would silently change 14.9% of spans by up to 665x.
+                "range_stats_n", "fb_span_q")
 _CACHE: dict[tuple, tuple] = {}
 
 
@@ -63,7 +68,13 @@ def get_corpus(cfg):
     if key not in _CACHE:
         train_ds = Live2DDataset(cfg, split="train")
         val_ds = Live2DDataset(cfg, split="val")
-        g_lo, g_hi, per_lo, per_hi = compute_range(train_ds, n=400)
+        g_lo, g_hi, per_lo, per_hi, fb_span = compute_range(
+            train_ds, n=getattr(cfg, 'range_stats_n', None))
+        # cfg.fb_span is a DERIVED value (it lives on cfg only so that
+        # mean_range_vecs can see it). Recompute it whenever it is missing;
+        # which quantile that is depends on cfg.fb_span_q, and that is what
+        # distinguishes a fixed run (0.5) from a legacy one (-1, set below).
+        cfg.fb_span = fb_span
         _CACHE[key] = (train_ds, val_ds, g_lo, g_hi, per_lo, per_hi)
     return _CACHE[key]
 
@@ -82,11 +93,29 @@ def load_ctx(run: str, device: torch.device, n_samples: int,
 
     sd = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = PipelineConfig()
-    cfg.__dict__.update(sd.get("cfg", {}))          # restore the run's own config
+    _saved_cfg = sd.get("cfg", {})
+    cfg.__dict__.update(_saved_cfg)                 # restore the run's own config
+    _legacy_range = "range_stats_n" not in _saved_cfg
+    if _legacy_range:
+        # Checkpoints saved before outputs/_patch_range_fix.py carry neither
+        # key. They were trained under n=400 stats + GLOBAL-range fallback, and
+        # they MUST be scored under exactly that: those stats cover only
+        # 29/251 train characters, so 14.9% of val instances were given a
+        # 1130-wide span (665x their true median span) and carry ~88% of
+        # abs_mae's weighting. Scoring them with the fixed stats would change
+        # the metric without changing the model - i.e. compare apples to
+        # oranges. fb_span_q < 0 restores the global-range fallback.
+        cfg.range_stats_n = 400
+        cfg.fb_span_q = -1.0
+        cfg.fb_span = None
 
     train_ds, val_ds, g_lo, g_hi, per_lo, per_hi = get_corpus(cfg)
+    print(f"  [{run}] range stats: n={cfg.range_stats_n} "
+          f"fb_span_q={cfg.fb_span_q} fb_span={cfg.fb_span:.4f}"
+          f"{'  (LEGACY checkpoint -> forced to n=400 / global fallback)' if _legacy_range else ''}")
     model = Live2DModel(cfg, train_ds.word2idx, len(train_ds.action2idx),
-                        cfg.max_tokens, train_ds.action_char2idx)
+                        cfg.max_tokens, train_ds.action_char2idx,
+                        getattr(train_ds, "param2idx", None))
     model.to(device)
     # strict=False: arms D/E predate the ParamNameEncoder bug fix (commit 23d0459),
     # so their checkpoints have no "name_enc.*" weights - and during those runs the

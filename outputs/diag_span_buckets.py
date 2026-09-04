@@ -46,28 +46,36 @@ CACHE = ROOT / "outputs" / "eval_dumps" / "_val_spans_cache.pkl"
 DEFAULT = "abl_H_regress285_ep45"
 
 
-def build_val_spans(cfg) -> np.ndarray:
-    """Floored span of every param-instance, in recon_metrics iteration order."""
+def build_val_spans(cfg):
+    """Floored span + param name of every instance, in recon_metrics order.
+
+    Returns ``(spans, names)``. CPU only - no model forward is needed because
+    the span depends solely on (param name, per-param range stats).
+    """
     if CACHE.exists():
         with open(CACHE, "rb") as f:
             blob = pickle.load(f)
-        if blob.get("n_pad") == cfg.max_tokens:
-            return blob["spans"]
+        if blob.get("n_pad") == cfg.max_tokens and "names" in blob:
+            return blob["spans"], blob["names"], blob["g_range"]
 
     train_ds = Live2DDataset(cfg, split="train")
     val_ds = Live2DDataset(cfg, split="val")
-    g_lo, g_hi, per_lo, per_hi = compute_range(train_ds, n=400)
+    g_lo, g_hi, per_lo, per_hi, fb_span = compute_range(
+        train_ds, n=getattr(cfg, 'range_stats_n', None))
+    if getattr(cfg, 'fb_span', None) is None:
+        cfg.fb_span = fb_span
     min_span = max(g_hi - g_lo, 1.0) * 0.02
 
     loader = DataLoader(val_ds, batch_size=4, sampler=SequentialSampler(val_ds),
                         collate_fn=lambda b: collate(b, cfg.max_tokens),
                         num_workers=0)
     spans: list[float] = []
+    pnames: list[str] = []
     for batch in loader:
         names = batch["names"]
         token_mask = batch["token_mask"]
-        lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi,
-                                     cfg.max_tokens)
+        lo_v, hi_v = mean_range_vecs(names, per_lo, per_hi, g_lo, g_hi, cfg.max_tokens,
+                             fb_span=getattr(cfg, 'fb_span', None))
         span_v = np.clip(hi_v - lo_v, min_span, None)     # (B, n_pad)
         B, n = token_mask.shape
         for b in range(B):
@@ -75,14 +83,17 @@ def build_val_spans(cfg) -> np.ndarray:
                 if token_mask[b, j] < 0.5:
                     continue
                 spans.append(float(span_v[b, j]))
+                pnames.append(names[b][j])
     arr = np.asarray(spans, dtype=np.float64)
     with open(CACHE, "wb") as f:
-        pickle.dump({"n_pad": cfg.max_tokens, "spans": arr}, f)
+        pickle.dump({"n_pad": cfg.max_tokens, "spans": arr, "names": pnames,
+                     "g_range": float(g_hi - g_lo)}, f)
     print(f"[cached val spans for {len(arr)} param-instances -> {CACHE.name}]")
-    return arr
+    return arr, np.asarray(pnames), float(g_hi - g_lo)
 
 
-def analyse(run: str, spans: np.ndarray) -> None:
+def analyse(run: str, spans: np.ndarray, pnames: np.ndarray,
+            g_range: float) -> None:
     path = DUMPS / f"{run}.npz"
     if not path.exists():
         print(f"  !! no dump for {run}")
@@ -135,15 +146,60 @@ def analyse(run: str, spans: np.ndarray) -> None:
                         "is just span-weighted")
         print(f"    VERDICT: {verdict}")
 
+    # ---- THE BIG ONE: is the top-span decile a range-fallback artefact? -----
+    # mean_range_vecs() seeds lo/hi with the GLOBAL range and only overwrites
+    # params present in per_lo/per_hi (built from just 400 samples). Any param
+    # missing from that dict silently gets span = g_hi - g_lo, i.e. it is
+    # treated as if it traversed the entire global range even when it is a
+    # constant. abs_mae = normalised_error * span, so those instances are
+    # inflated by ~50x and can dominate the whole metric.
+    fb = np.abs(sp - g_range) < 1e-3
+    print(f"\n  !! range-fallback check (span == global range {g_range:.1f}): "
+          f"{fb.sum()} instances ({fb.mean() * 100:.1f}%)")
+    if fb.sum():
+        print(f"     their share of the model's total abs_mae : "
+              f"{m[fb].sum() / m.sum() * 100:.1f}%")
+        print(f"     their share of the prior's total abs_mae: "
+              f"{e[fb].sum() / e.sum() * 100:.1f}%")
+        print(f"     mean abs error on them   : model {m[fb].mean():.4f} vs "
+              f"prior {e[fb].mean():.4f}")
+        print(f"     mean NORMALISED error    : model "
+              f"{(m[fb] / sp[fb]).mean():.5f} vs prior "
+              f"{(e[fb] / sp[fb]).mean():.5f}   <-- both tiny")
+        print(f"     distinct params affected : {len(set(pnames[fb]))}")
+        excl_m = m[~fb].mean()
+        excl_e = e[~fb].mean()
+        print(f"     EXCLUDING them: model {excl_m:.4f} vs prior {excl_e:.4f} "
+              f"= {(excl_e - excl_m) / excl_e * 100:+.1f}%   "
+              f"<-- vs {((e.mean() - m.mean()) / e.mean() * 100):+.1f}% with them")
+
+    # ---- which params make up the losing top-span decile? -------------------
+    # Decides whether the damage is visually important: params like ParamMouseX
+    # span the whole canvas but barely move the character, whereas ParamAngleZ
+    # is small-range yet highly visible.
+    order_s = np.argsort(sp)
+    top = order_s[9 * n // 10:]
+    uniq, counts = np.unique(pnames[top], return_counts=True)
+    o = np.argsort(-counts)
+    print(f"\n  top-span decile composition ({len(top)} instances, "
+          f"mean span {sp[top].mean():.1f}) - top 12 params:")
+    for u, c in list(zip(uniq[o], counts[o]))[:12]:
+        sel = top[pnames[top] == u]
+        g = ((e[sel].mean() - m[sel].mean()) / e[sel].mean() * 100
+             if e[sel].mean() else float("nan"))
+        print(f"    {u:<28} n={c:<6} span={sp[sel].mean():>8.1f} "
+              f"exem={e[sel].mean():>8.3f} model={m[sel].mean():>8.3f} "
+              f"({g:+.1f}%)")
+
 
 def main() -> int:
     cfg = PipelineConfig()
     cfg.subset_models = 285
     cfg.action_cond = "id"
     cfg.eval_shared_min_models = 5
-    spans = build_val_spans(cfg)
+    spans, pnames, g_range = build_val_spans(cfg)
     for r in (sys.argv[1:] or [DEFAULT]):
-        analyse(r, spans)
+        analyse(r, spans, pnames, g_range)
     return 0
 
 

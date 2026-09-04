@@ -64,7 +64,10 @@ def main() -> int:
 
     train_ds = Live2DDataset(cfg, split="train")
     val_ds = Live2DDataset(cfg, split="val")
-    g_lo, g_hi, per_lo, per_hi = compute_range(train_ds, n=400)
+    g_lo, g_hi, per_lo, per_hi, fb_span = compute_range(
+        train_ds, n=getattr(cfg, 'range_stats_n', None))
+    if getattr(cfg, 'fb_span', None) is None:
+        cfg.fb_span = fb_span
 
     model = Live2DModel(cfg, train_ds.word2idx, len(train_ds.action2idx),
                         cfg.max_tokens, train_ds.action_char2idx)
