@@ -59,7 +59,19 @@ _CORPUS_KEYS = ("subset_models", "T", "fps", "k_exemplars", "max_tokens",
                 # runs that differ here must never share a cached corpus:
                 # reusing a full-corpus (g_lo, per_lo, ...) for a legacy run
                 # would silently change 14.9% of spans by up to 665x.
-                "range_stats_n", "fb_span_q")
+                "range_stats_n", "fb_span_q",
+                # V9: corpus-defining settings. Two runs that differ in any of
+                # these build a different train/val split, so they must never
+                # share a cached corpus.
+                "data_root", "val_holdout_path", "dedup_skip_path",
+                "action_map_path", "cache_tag",
+                # V11a: these change the per-sample tensors (rig is recomputed
+                # leave-one-out; cstats is added to the batch only when the
+                # feature is on), so a cached corpus must never be reused
+                # across runs that differ in them.
+                "rig_loo", "char_stats",
+                # V11b: adds the K reference-curve tensors to every batch.
+                "bank_cond", "bank_k")
 _CACHE: dict[tuple, tuple] = {}
 
 
@@ -71,16 +83,22 @@ def get_corpus(cfg):
         g_lo, g_hi, per_lo, per_hi, fb_span = compute_range(
             train_ds, n=getattr(cfg, 'range_stats_n', None))
         # cfg.fb_span is a DERIVED value (it lives on cfg only so that
-        # mean_range_vecs can see it). Recompute it whenever it is missing;
-        # which quantile that is depends on cfg.fb_span_q, and that is what
-        # distinguishes a fixed run (0.5) from a legacy one (-1, set below).
-        cfg.fb_span = fb_span
+        # mean_range_vecs can see it). Fill it in only when the caller has not
+        # pinned it, because None is a meaningful value there: it selects the
+        # LEGACY fill (g_lo, g_hi), which is NOT equivalent to (0, fb_span)
+        # even when the spans coincide - the network is nonlinear in its input,
+        # so a constant offset in the normalised units does not cancel out.
+        # Measured: forcing the (0, fb_span) fill on a legacy checkpoint moved
+        # K from 1.1401 to 1.1871 and H from 1.2630 to 1.2865.
+        if getattr(cfg, "fb_span", "UNSET") == "UNSET":
+            cfg.fb_span = fb_span
         _CACHE[key] = (train_ds, val_ds, g_lo, g_hi, per_lo, per_hi)
     return _CACHE[key]
 
 
 def load_ctx(run: str, device: torch.device, n_samples: int,
-             which: str = "best", stratified: int = 0) -> dict:
+             which: str = "best", stratified: int = 0,
+             override: dict | None = None) -> dict:
     """Build everything needed to score one checkpoint.
 
     Split out from :func:`evaluate` so a residual-scale sweep can pay the
@@ -95,6 +113,14 @@ def load_ctx(run: str, device: torch.device, n_samples: int,
     cfg = PipelineConfig()
     _saved_cfg = sd.get("cfg", {})
     cfg.__dict__.update(_saved_cfg)                 # restore the run's own config
+    if override:
+        # Deliberate post-hoc change of a DATA-SIDE setting, e.g. forcing
+        # rig_loo=True on a checkpoint that was trained with the leaky rig.
+        # This is how we measure the size of the leak without retraining:
+        # the model is unchanged, only what it is shown at eval time is.
+        for k, v in override.items():
+            setattr(cfg, k, v)
+        print(f"  [{run}] OVERRIDE {override}")
     _legacy_range = "range_stats_n" not in _saved_cfg
     if _legacy_range:
         # Checkpoints saved before outputs/_patch_range_fix.py carry neither
@@ -111,8 +137,9 @@ def load_ctx(run: str, device: torch.device, n_samples: int,
 
     train_ds, val_ds, g_lo, g_hi, per_lo, per_hi = get_corpus(cfg)
     print(f"  [{run}] range stats: n={cfg.range_stats_n} "
-          f"fb_span_q={cfg.fb_span_q} fb_span={cfg.fb_span:.4f}"
-          f"{'  (LEGACY checkpoint -> forced to n=400 / global fallback)' if _legacy_range else ''}")
+          f"fb_span_q={cfg.fb_span_q} fb_span="
+          f"{'legacy (g_lo,g_hi) fill' if cfg.fb_span is None else f'{cfg.fb_span:.4f}'}"
+          f"{'  (LEGACY checkpoint -> forced to n=400 / global fill)' if _legacy_range else ''}")
     model = Live2DModel(cfg, train_ds.word2idx, len(train_ds.action2idx),
                         cfg.max_tokens, train_ds.action_char2idx,
                         getattr(train_ds, "param2idx", None))
@@ -149,7 +176,8 @@ def load_ctx(run: str, device: torch.device, n_samples: int,
             val_ds, batch_size=4, sampler=SequentialSampler(val_ds),
             collate_fn=lambda b: collate(b, cfg.max_tokens), num_workers=0)
         cap = n_samples if n_samples > 0 else len(val_ds)
-    return dict(run=run, device=device, model=model, cfg=cfg, loader=loader,
+    label = run if not override else run + "+rigloo"
+    return dict(run=label, device=device, model=model, cfg=cfg, loader=loader,
                 cap=cap, per_lo=per_lo, per_hi=per_hi, g_lo=g_lo, g_hi=g_hi,
                 alphabar=alphabar, sd=sd)
 
@@ -235,13 +263,19 @@ def main() -> int:
     ap.add_argument("--sweep", type=str, default="",
                     help="comma-separated w values; loads each checkpoint ONCE and "
                          "scores it at every w (cheap trade-off curve, no retraining)")
+    ap.add_argument("--rig_loo", action="store_true",
+                    help="V11a: score with the TARGET motion removed from the 96d "
+                         "rig feature. The model is NOT retrained - this isolates "
+                         "how much of a run's score came from the rig leak.")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     sweeps = [float(x) for x in args.sweep.split(",") if x.strip()] if args.sweep else []
+    override = {"rig_loo": True} if args.rig_loo else None
     res = []
     for r in args.runs:
-        ctx = load_ctx(r, device, args.n_samples, args.ckpt, args.stratified)
+        ctx = load_ctx(r, device, args.n_samples, args.ckpt, args.stratified,
+                       override)
         for w in (sweeps if sweeps else [args.residual_scale]):
             one = evaluate(ctx, w)
             if args.dump:

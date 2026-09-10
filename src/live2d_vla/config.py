@@ -14,12 +14,50 @@ class PipelineConfig:
     gen_mask_path: Path = ROOT / "outputs" / "gen_mask.json"
     whitelist_path: Path = ROOT / "outputs" / "model_whitelist.json"
     retrieval_index: Path = ROOT / "outputs" / "retrieval_index.jsonl"
+    # ---- V9 data hygiene (all OFF by default = old behaviour) -------------- #
+    # Pinned validation characters (JSON list of model names). Needed because
+    # val_frac draws a DIFFERENT holdout as soon as the whitelist grows, which
+    # makes abs_mae incomparable across data scales.
+    val_holdout_path: str = ""
+    # {model: [action, ...]} to drop: the same (moc3 md5, motion md5) pair
+    # already occurs earlier in the corpus. See outputs/prep_v9.py.
+    dedup_skip_path: str = ""
+    # Semantic action consolidation map (outputs/action_semantic_map.json).
+    action_map_path: str = ""
+    # Namespaces outputs/exem_cache_*.pkl, ident_cache_*.pkl, range_cache_*.pkl
+    # so runs that share subset_models but not the corpus never share a cache.
+    cache_tag: str = ""
     fps: float = 30.0
     T: int = 48                       # frames per generated clip (~1.6s)
     subset_models: int = 60           # first N whitelisted models (MVP scope)
     k_exemplars: int = 3              # B1 cross-character same-action references
     max_tokens: int = 128             # pad the per-model token dim to this
     rig_sig_dim: int = 96             # structured per-param identity feature (2*K, K=48)
+
+    # ---- V11a: character-conditioned features (leave-one-out) ----
+    # Measured (outputs/diag_ref_prior3.py): build_model_identity aggregates each
+    # model's per-param (min, max, mean) over ALL its motions, INCLUDING the
+    # target motion. 29.2% of channels have the target contributing >=50% of the
+    # global range and 5.2% have it as the sole contributor -> the 96d rig
+    # feature leaks the target's amplitude. That is why the model improves
+    # point-wise MAE by +39.8% but shape (1st-difference) MAE by only +2.1%.
+    # rig_loo=True excludes the target motion from its own identity vector,
+    # which is also exactly what deployment does (the target does not exist yet).
+    rig_loo: bool = False
+    # Per-token statistics of THIS character's OTHER motions for the same param
+    # (rest value, amplitude, p10/p90 envelope, support count). Measured: the
+    # character's own motion bank carries +85% real signal over any other
+    # character's bank, and the exact rest value is worth 1.31 -> 0.03 abs_mae
+    # on the 43.9% of channels whose target is constant. "none" = off,
+    # "mlp" = a zero-init Linear(5, d) added to the token embedding (so a
+    # char_stats run starts bit-identical to the baseline).
+    char_stats: str = "none"
+    # V11b: condition on the character's OWN motion bank (its other motions).
+    # "attn" = per-param cross-attention over K reference curves; the attended
+    # curve also enters in_proj as a 3rd channel. "none" keeps the 2-channel
+    # baseline bit-identical.
+    bank_cond: str = "none"          # "none" | "attn"
+    bank_k: int = 8                  # reference actions sampled per sample
 
     # ---- model ----
     d_model: int = 384
@@ -113,6 +151,16 @@ class PipelineConfig:
     # so a gated run starts from the ungated model's behaviour.
     residual_gate: str = "none"       # "none" | "name"
 
+    # ---- per-token span conditioning (V8.3) ----
+    # The model never OBSERVES each param's absolute range: span enters only the
+    # normalisation (x0/span) and the loss weighting (span_w), so the network
+    # has to infer "is this a large-range param?" indirectly from its name.
+    # §20/§21 showed residual overshoot is strongly span-correlated, so we give
+    # the model the answer directly: inject log(span) as a per-token feature.
+    # "none" = legacy. "log" = add Linear(1,d)(log span) to the token embedding.
+    # Zero-init makes a span_cond="log" run start bit-identical to "none".
+    span_cond: str = "none"           # "none" | "log"
+
     # ---- checkpoint selection (V8.2) ----
     # WHICH score decides `ckpt_best.pt` / early stopping.
     # "val_loss" is the legacy choice and is WRONG: measured on abl_K_span1 the
@@ -121,6 +169,22 @@ class PipelineConfig:
     # metric the gate is written against. span-weighted losses make val_loss and
     # abs_mae diverge even harder, so selection must follow the target metric.
     select_metric: str = "val_loss"   # "val_loss" | "abs" | "rel_f"
+
+    # ---- structured latent head (V10) ------------------------------------- #
+    # The dense head outputs a P x T residual per sample, but the residual is
+    # actually ~rank-2 (diag_residual_rank.py: k90=2/48, PR 1.29 vs 2.46 noise)
+    # and is ~orthogonal to the prior (cos -0.012). diag_oracle_ceiling.py shows
+    # x0_hat = exem*(1+alpha) + rank-2 shape correction has abs_mae ceiling
+    # 0.204 vs the dense head's 0.978. So we replace the PxT head with a
+    # structured one: a per-param amplitude gain alpha (P dims) + a low-rank
+    # shape correction U_r @ C where U_r is a small set of global time bases.
+    #
+    # "dense"       = legacy Linear(d,1) -> PxT residual (the R-arm head).
+    # "structured"  = exem*(1+alpha) + coef @ basis, alpha in R^P, coef in R^(P,r),
+    #                 basis in R^(r,T) (DCT low-freq bases). Output dims collapse
+    #                 from P*T (~2688) to P*(1+r) (~56*3=168).
+    head_mode: str = "dense"         # "dense" | "structured"
+    residual_rank: int = 2           # r = number of global shape bases (rank)
 
     # ---- per-param range statistics (see outputs/_patch_range_fix.py) ----
     # None = scan the whole train corpus (one pass, ~3.5 min, cached to

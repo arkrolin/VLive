@@ -149,6 +149,9 @@ def _range_cache_path(cfg, n_req, n_samples):
         return None
     subset = int(getattr(cfg, "subset_models", 0))
     tag = "all" if n_req is None else str(int(n_req))
+    ct = getattr(cfg, "cache_tag", "") or ""
+    if ct:
+        tag = f"{tag}_{ct}"
     return (ROOT / "outputs"
             / f"range_cache_{subset}_{tag}_{n_samples}.pkl")
 
@@ -255,6 +258,37 @@ def mean_range_vecs(names_b, per_lo, per_hi, g_lo, g_hi, max_tokens,
     return lo_v, hi_v
 
 
+def normalize_cstats(cstats, lo_t, span_t):
+    """Put the raw-unit V11a character features into the same space as x0.
+
+    Columns (see dataset.CHAR_STATS_NAMES):
+      rest, lo, hi  are param VALUES -> (v - lo) / span, same map as the curves
+      amp           is a RANGE       -> amp / span
+      log1p_cnt     is scale-free    -> unchanged
+    Clamped so a pathological span cannot blow up the token embedding.
+    """
+    if cstats is None:
+        return None
+    cs = cstats.to(device=lo_t.device, dtype=lo_t.dtype)
+    out = torch.empty_like(cs)
+    out[..., 0] = (cs[..., 0] - lo_t) / span_t
+    out[..., 1] = cs[..., 1] / span_t
+    out[..., 2] = (cs[..., 2] - lo_t) / span_t
+    out[..., 3] = (cs[..., 3] - lo_t) / span_t
+    out[..., 4] = cs[..., 4]
+    return out.clamp(-6.0, 6.0)
+
+
+def normalize_bank(bank, lo_t, span_t):
+    """Put the V11b reference curves in the same normalised space as x0/exem."""
+    if bank is None:
+        return None
+    b = bank.to(device=lo_t.device, dtype=lo_t.dtype)
+    lo = lo_t.unsqueeze(1).unsqueeze(-1)      # (B,1,n,1)
+    sp = span_t.unsqueeze(1).unsqueeze(-1)
+    return ((b - lo) / sp).clamp(-0.5, 1.5)
+
+
 def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     # `model` may be DDP-wrapped; q_sample lives on the unwrapped module.
     q_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -278,6 +312,10 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     # per-param RANGE normalization -> units of fraction of range
     x0 = ((target - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
     exem_s = ((exem - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
+    cs = batch.get("cstats")
+    cstats = normalize_cstats(cs, lo_t, span_t) if cs is not None else None
+    bk = batch.get("bank")
+    bank = normalize_bank(bk, lo_t, span_t) if bk is not None else None
     B = x0.shape[0]
     if getattr(cfg, "gen_mode", "ddpm") == "regress":
         # P1 arm A: deterministic residual regression - no noise, t=0. The model
@@ -297,7 +335,10 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     # x0-PREDICTION: network regresses clean x0 directly (+ exem prior).
     # loss = masked MSE(x0_hat, x0) in fraction-of-range units == rel_mae^2.
     x0_hat = model(x_t, t, names, rig, action_id, token_mask, exem_s, training=True,
-                   action_chars=action_chars)
+                   action_chars=action_chars, span=span_t, cstats=cstats,
+                   bank=bank,
+                   bank_mask=batch.get("bank_mask"),
+                   bank_act=batch.get("bank_act"))
     se = (x0_hat - x0) ** 2
     aw = torch.from_numpy(
         arm_weight(names, arm_w, n_pad=cfg.max_tokens)).to(device).unsqueeze(-1)
@@ -320,7 +361,8 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
 @torch.no_grad()
 def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
                  device, steps: int = 50, eta: float = 0.0, t_start: int = None,
-                 action_chars=None):
+                 action_chars=None, span=None, cstats=None, bank=None,
+                 bank_mask=None, bank_act=None):
     """x0-prediction DDIM reverse: x0_hat (per-param std units) from x_T.
 
     t_start: highest timestep index to reverse from. Defaults to S-1 (full
@@ -336,7 +378,9 @@ def ddim_reverse(model, x_T, names, rig, action_id, token_mask, exem_s, alphabar
         t_cur = ts[i]
         t_batch = t_cur.view(1).expand(x.shape[0]).to(device)
         x0_hat = model(x, t_batch, names, rig, action_id, token_mask, exem_s,
-                       training=False, action_chars=action_chars)
+                       training=False, action_chars=action_chars, span=span,
+                       cstats=cstats, bank=bank, bank_mask=bank_mask,
+                       bank_act=bank_act)
         x0_hat = x0_hat * token_mask.unsqueeze(-1)
         a_cur = alphabar[t_cur]
         if i == steps - 1:                          # reached t=0 -> x0
@@ -411,19 +455,27 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         exem_s = ((batch["exem"].to(device) - lo_t.unsqueeze(-1))
                   / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
         x0 = ((target - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
+        cb = batch.get("cstats")
+        cstats = normalize_cstats(cb, lo_t, span_t) if cb is not None else None
+        bb = batch.get("bank")
+        bank = normalize_bank(bb, lo_t, span_t) if bb is not None else None
 
         if getattr(cfg, "gen_mode", "ddpm") == "regress":
             t0 = torch.zeros(B, device=device, dtype=torch.long)
             x0_hat = model(torch.zeros_like(x0), t0, names, rig, action_id,
                            token_mask, exem_s, training=False,
-                           action_chars=action_chars)
+                           action_chars=action_chars, span=span_t, cstats=cstats,
+                           bank=bank, bank_mask=batch.get("bank_mask"),
+                           bank_act=batch.get("bank_act"))
         else:
             x_T = torch.randn(B, n, T, device=device)
             x0_hat = ddim_reverse(
                 model, x_T, names, rig, action_id, token_mask, exem_s, alphabar,
                 device, steps=steps,
                 t_start=int(getattr(cfg, "max_diff_t", 1000)),
-                action_chars=action_chars)
+                action_chars=action_chars, span=span_t, cstats=cstats,
+                bank=bank, bank_mask=batch.get("bank_mask"),
+                bank_act=batch.get("bank_act"))
         if residual_scale != 1.0:
             x0_hat = exem_s + residual_scale * (x0_hat - exem_s)
         x0_hat = x0_hat.clamp(-0.5, 1.5)
@@ -530,12 +582,52 @@ def parse_args():
                    choices=["none", "name"],
                    help="learnable per-param-name gate g on the residual: "
                         "x0_hat = exem + g * residual")
+    p.add_argument("--span_cond", type=str, default=None,
+                   choices=["none", "log"],
+                   help="inject log(span) as a per-token feature so the model "
+                        "sees each param's absolute range (V8.3)")
     p.add_argument("--select_metric", type=str, default=None,
                    choices=["val_loss", "abs", "rel_f"],
                    help="score that decides ckpt_best.pt and early stopping. "
                         "'val_loss' is the legacy choice and is misaligned with "
                         "the gate: on abl_K_span1 it picks ep32 (abs 1.3654) "
                         "over ep45 (abs 1.1401). Forces eval_every=1.")
+    p.add_argument("--head_mode", type=str, default=None,
+                   choices=["dense", "structured"],
+                   help="V10: dense (PxT residual head) | structured "
+                        "(per-param gain + low-rank DCT shape correction)")
+    p.add_argument("--residual_rank", type=int, default=None,
+                   help="V10: r = number of global DCT shape bases (structured head)")
+    # ---- V11a: character conditioning (leave-one-out) --------------------- #
+    p.add_argument("--rig_loo", action="store_true", default=None,
+                   help="V11a: exclude the TARGET motion from the model's own "
+                        "96d identity feature. Without it the rig leaks the "
+                        "target's amplitude (measured on 29.2% of channels).")
+    p.add_argument("--char_stats", type=str, default=None,
+                   choices=["none", "mlp"],
+                   help="V11a: per-token leave-one-out statistics of THIS "
+                        "character's OTHER motions (rest / amplitude / envelope "
+                        "/ support count) added to the token embedding")
+    p.add_argument("--bank_cond", type=str, default=None,
+                   choices=["none", "attn"],
+                   help="V11b: per-param cross-attention over the character's "
+                        "OWN other motion curves (K sampled references)")
+    p.add_argument("--bank_k", type=int, default=None,
+                   help="V11b: number of reference actions per sample")
+    # ---- V9: which corpus, and how it is cleaned -------------------------- #
+    p.add_argument("--data_root", type=str, default=None,
+                   help="model root (one level of model dirs). "
+                        "'data/all' = standrad + Live2d-model-master flattened.")
+    p.add_argument("--whitelist_path", type=str, default=None)
+    p.add_argument("--gen_mask_path", type=str, default=None)
+    p.add_argument("--val_holdout_path", type=str, default=None,
+                   help="JSON list pinning the validation characters")
+    p.add_argument("--dedup_skip_path", type=str, default=None,
+                   help="JSON {model: [action,...]} of (body,action) duplicates")
+    p.add_argument("--action_map_path", type=str, default=None,
+                   help="semantic action-consolidation map")
+    p.add_argument("--cache_tag", type=str, default=None,
+                   help="namespace for exem/ident/range caches")
     p.add_argument("--fresh", action="store_true",
                    help="ignore existing checkpoint and retrain")
     return p.parse_args()
@@ -591,8 +683,40 @@ def main():
         cfg.val_recon_samples = args.val_recon_samples
     if args.residual_gate is not None:
         cfg.residual_gate = args.residual_gate
+    if args.span_cond is not None:
+        cfg.span_cond = args.span_cond
     if args.select_metric is not None:
         cfg.select_metric = args.select_metric
+    if args.head_mode is not None:
+        cfg.head_mode = args.head_mode
+    if args.residual_rank is not None:
+        cfg.residual_rank = args.residual_rank
+    if args.rig_loo is not None:
+        cfg.rig_loo = bool(args.rig_loo)
+    if args.char_stats is not None:
+        cfg.char_stats = args.char_stats
+    if args.bank_cond is not None:
+        cfg.bank_cond = args.bank_cond
+    if args.bank_k is not None:
+        cfg.bank_k = args.bank_k
+    # ---- V9 corpus selection ---------------------------------------------- #
+    if args.data_root is not None:
+        p_ = Path(args.data_root)
+        cfg.data_root = p_ if p_.is_absolute() else (ROOT / p_)
+    if args.whitelist_path is not None:
+        p_ = Path(args.whitelist_path)
+        cfg.whitelist_path = p_ if p_.is_absolute() else (ROOT / p_)
+    if args.gen_mask_path is not None:
+        p_ = Path(args.gen_mask_path)
+        cfg.gen_mask_path = p_ if p_.is_absolute() else (ROOT / p_)
+    if args.val_holdout_path is not None:
+        cfg.val_holdout_path = args.val_holdout_path
+    if args.dedup_skip_path is not None:
+        cfg.dedup_skip_path = args.dedup_skip_path
+    if args.action_map_path is not None:
+        cfg.action_map_path = args.action_map_path
+    if args.cache_tag is not None:
+        cfg.cache_tag = args.cache_tag
     if cfg.select_metric != "val_loss":
         # the selection score is only computed by recon_metrics, so it has to
         # run every epoch; otherwise ckpt_best would silently stay at epoch 1.
@@ -622,7 +746,15 @@ def main():
               f"range_stats_n={cfg.range_stats_n} fb_span_q={cfg.fb_span_q} "
               f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
               f"patience={cfg.early_stop_patience} "
-              f"residual_gate={cfg.residual_gate} select_metric={cfg.select_metric}")
+              f"residual_gate={cfg.residual_gate} select_metric={cfg.select_metric} "
+              f"span_cond={cfg.span_cond}")
+        print(f"[rank{rank}] V9 corpus: data_root={cfg.data_root.name} "
+              f"whitelist={Path(cfg.whitelist_path).name} "
+              f"gen_mask={Path(cfg.gen_mask_path).name} "
+              f"cache_tag={cfg.cache_tag or '-'} "
+              f"holdout={Path(cfg.val_holdout_path).name if cfg.val_holdout_path else '-'} "
+              f"dedup={Path(cfg.dedup_skip_path).name if cfg.dedup_skip_path else '-'} "
+              f"action_map={Path(cfg.action_map_path).name if cfg.action_map_path else '-'}")
 
     model = Live2DModel(cfg, train_ds.word2idx, action_vocab_size, n_tokens_pad,
                         train_ds.action_char2idx,

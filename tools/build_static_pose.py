@@ -45,6 +45,22 @@ FPS = 30.0
 EPS = 1e-4         # within-motion peak-to-peak below this counts as flat
 
 
+def _safe(s: str) -> str:
+    """Make a filename UTF-8-serialisable.
+
+    Live2d-model-master ships GBK/Shift-JIS directory names, which Python reads
+    as lone surrogates; orjson (used below) raises
+    `TypeError: str is not valid UTF-8: surrogates not allowed` on those.
+    Names are now ASCII by construction (see outputs/make_unified_root.py); this
+    is belt-and-braces so the tool never dies on one bad directory again.
+    """
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def load_json(p: Path):
     try:
         return orjson.loads(p.read_bytes())
@@ -174,7 +190,7 @@ def main() -> None:
         if r is None:
             agg["skipped (no usable motions)"] += 1
             continue
-        out[md.name] = r
+        out[_safe(md.name)] = r
         p = r["param"]
         agg["models"] += 1
         agg["const"] += len(p["const"])
