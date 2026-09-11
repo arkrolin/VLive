@@ -23,7 +23,8 @@ ROOT = Path("/root/work/nlp/xjzhao13/lijie_llama/VLive")
 sys.path.insert(0, str(ROOT / "src" / "live2d_vla"))
 sys.path.insert(0, str(ROOT / "outputs"))
 
-from train import mean_range_vecs, collate  # noqa: E402
+from train import (mean_range_vecs, collate,  # noqa: E402
+                   normalize_cstats, normalize_bank)
 import eval_ckpt  # noqa: E402
 
 
@@ -73,10 +74,25 @@ def main() -> None:
                       / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
             x0 = ((target - lo_t.unsqueeze(-1)) / span_t.unsqueeze(-1)).clamp(-0.5, 1.5)
 
+            # V11+ conditioning. Skipping these silently degrades any run that
+            # was trained with them (cstats is per-token character stats; bank
+            # is the character's own motion library) - which is exactly how a
+            # V11a render once scored 1.5605 against an eval_ckpt 0.8720.
+            cb = batch.get("cstats")
+            cstats = normalize_cstats(cb, lo_t, span_t) if cb is not None else None
+            bb = batch.get("bank")
+            bank = normalize_bank(bb, lo_t, span_t) if bb is not None else None
+            bb_m = batch.get("bank_mask")
+            bb_a = batch.get("bank_act")
+            bank_mask = bb_m.to(device) if bb_m is not None else None
+            bank_act = bb_a.to(device) if bb_a is not None else None
+
             t0 = torch.zeros(B, device=device, dtype=torch.long)
             x0_hat = model(torch.zeros_like(x0), t0, names, rig, action_id,
                            token_mask, exem_s, training=False,
-                           action_chars=action_chars, span=span_t)
+                           action_chars=action_chars, span=span_t,
+                           cstats=cstats, bank=bank, bank_mask=bank_mask,
+                           bank_act=bank_act)
             x0_hat = x0_hat.clamp(-0.5, 1.5)
 
             span_np = span_t.cpu().numpy()
@@ -105,6 +121,7 @@ def main() -> None:
                     idx=idx, model=model_id, action=action, names=nm,
                     pred=pred.astype(np.float32), target=tgt.astype(np.float32),
                     exem=exm.astype(np.float32), T=int(T),
+                    span=sp.astype(np.float32),
                 ))
                 manifest.append(dict(
                     idx=idx, model=model_id, action=action, n_params=len(nm),
