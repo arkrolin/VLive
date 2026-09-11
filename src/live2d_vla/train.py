@@ -316,6 +316,10 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     cstats = normalize_cstats(cs, lo_t, span_t) if cs is not None else None
     bk = batch.get("bank")
     bank = normalize_bank(bk, lo_t, span_t) if bk is not None else None
+    bm = batch.get("bank_mask")
+    ba = batch.get("bank_act")
+    bank_mask = bm.to(device) if bm is not None else None
+    bank_act = ba.to(device) if ba is not None else None
     B = x0.shape[0]
     if getattr(cfg, "gen_mode", "ddpm") == "regress":
         # P1 arm A: deterministic residual regression - no noise, t=0. The model
@@ -336,9 +340,7 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
     # loss = masked MSE(x0_hat, x0) in fraction-of-range units == rel_mae^2.
     x0_hat = model(x_t, t, names, rig, action_id, token_mask, exem_s, training=True,
                    action_chars=action_chars, span=span_t, cstats=cstats,
-                   bank=bank,
-                   bank_mask=batch.get("bank_mask"),
-                   bank_act=batch.get("bank_act"))
+                   bank=bank, bank_mask=bank_mask, bank_act=bank_act)
     se = (x0_hat - x0) ** 2
     aw = torch.from_numpy(
         arm_weight(names, arm_w, n_pad=cfg.max_tokens)).to(device).unsqueeze(-1)
@@ -459,14 +461,17 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
         cstats = normalize_cstats(cb, lo_t, span_t) if cb is not None else None
         bb = batch.get("bank")
         bank = normalize_bank(bb, lo_t, span_t) if bb is not None else None
+        bb_m = batch.get("bank_mask")
+        bb_a = batch.get("bank_act")
+        bank_mask = bb_m.to(device) if bb_m is not None else None
+        bank_act = bb_a.to(device) if bb_a is not None else None
 
         if getattr(cfg, "gen_mode", "ddpm") == "regress":
             t0 = torch.zeros(B, device=device, dtype=torch.long)
             x0_hat = model(torch.zeros_like(x0), t0, names, rig, action_id,
                            token_mask, exem_s, training=False,
                            action_chars=action_chars, span=span_t, cstats=cstats,
-                           bank=bank, bank_mask=batch.get("bank_mask"),
-                           bank_act=batch.get("bank_act"))
+                           bank=bank, bank_mask=bank_mask, bank_act=bank_act)
         else:
             x_T = torch.randn(B, n, T, device=device)
             x0_hat = ddim_reverse(
@@ -474,8 +479,7 @@ def recon_metrics(model, loader, device, cfg, per_lo, per_hi, g_lo, g_hi,
                 device, steps=steps,
                 t_start=int(getattr(cfg, "max_diff_t", 1000)),
                 action_chars=action_chars, span=span_t, cstats=cstats,
-                bank=bank, bank_mask=batch.get("bank_mask"),
-                bank_act=batch.get("bank_act"))
+                bank=bank, bank_mask=bank_mask, bank_act=bank_act)
         if residual_scale != 1.0:
             x0_hat = exem_s + residual_scale * (x0_hat - exem_s)
         x0_hat = x0_hat.clamp(-0.5, 1.5)
