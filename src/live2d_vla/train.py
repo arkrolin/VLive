@@ -775,7 +775,7 @@ def main():
               f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
               f"patience={cfg.early_stop_patience} "
               f"residual_gate={cfg.residual_gate} select_metric={cfg.select_metric} "
-              f"span_cond={cfg.span_cond}")
+              f"span_cond={cfg.span_cond} shape_w={cfg.shape_w}")
         print(f"[rank{rank}] V9 corpus: data_root={cfg.data_root.name} "
               f"whitelist={Path(cfg.whitelist_path).name} "
               f"gen_mask={Path(cfg.gen_mask_path).name} "
