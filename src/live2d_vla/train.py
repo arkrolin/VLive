@@ -354,6 +354,23 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
         ratio = (span_t / ref).clamp(1.0 / cap, cap)
         valid = valid * ratio.pow(float(cfg.span_w)).unsqueeze(-1)
     loss = (se * valid).sum() / valid.sum().clamp(min=1.0)
+
+    # --- V11c: explicit SHAPE term -------------------------------------------
+    # Everything above is a per-frame LEVEL error, and level is dominated by the
+    # ~43% of channels that are constant over time (rest values). The objective
+    # therefore never asks the model to get the *motion* right. Measured across
+    # R -> V11a -> V11b, abs_mae improved +39% -> +42% -> +45% while delta MAE
+    # stayed at (or slightly worse than) the exem prior - the curves look no
+    # better than "output the cross-character action mean".
+    #
+    # First difference along T, weighted exactly like the level term so span_w
+    # keeps meaning "raw units" for both halves of the loss.
+    shape_w = float(getattr(cfg, "shape_w", 0.0))
+    if shape_w > 0:
+        d_hat = x0_hat[..., 1:] - x0_hat[..., :-1]
+        d_tgt = x0[..., 1:] - x0[..., :-1]
+        sd = (d_hat - d_tgt) ** 2
+        loss = loss + shape_w * (sd * valid).sum() / valid.sum().clamp(min=1.0)
     return loss
 
 
@@ -577,6 +594,11 @@ def parse_args():
                         "2 = raw-unit MSE (matches abs_mae)")
     p.add_argument("--span_w_cap", type=float, default=None,
                    help="clip the relative span ratio to [1/cap, cap] before pow")
+    p.add_argument("--shape_w", type=float, default=None,
+                   help="V11c: weight of the first-difference (shape) loss term. "
+                        "0 = level only (legacy). The level term is dominated by "
+                        "constant/rest channels, so shape never gets optimised "
+                        "regardless of abs_mae; this adds mean(dx_hat-dx)^2.")
     p.add_argument("--n_layers", type=int, default=None, help="DiT depth")
     p.add_argument("--patience", type=int, default=None,
                    help="early-stopping patience (epochs) on val_loss")
@@ -679,6 +701,8 @@ def main():
         cfg.fb_span_q = args.fb_span_q
     if args.span_w_cap is not None:
         cfg.span_w_cap = args.span_w_cap
+    if args.shape_w is not None:
+        cfg.shape_w = args.shape_w
     if args.n_layers is not None:
         cfg.n_layers = args.n_layers
     if args.patience is not None:

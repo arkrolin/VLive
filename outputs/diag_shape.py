@@ -60,14 +60,27 @@ def metrics(pred: np.ndarray, tgt: np.ndarray) -> dict[str, float]:
     return out
 
 
-def load_metrics(pkl: Path) -> dict[str, float]:
+def avg(xs: dict[str, list[float]]) -> dict[str, float]:
+    return {k: float(np.nanmean(v)) for k, v in xs.items()}
+
+
+def load_metrics(pkl: Path) -> tuple[dict[str, float], dict[str, float]]:
+    """Metrics for the model and for the exem prior stored in the same pickle.
+
+    Returning both matters: exem is the baseline to beat, and on SHAPE it is a
+    genuinely strong baseline (the cross-character action mean already carries
+    the temporal pattern). A model that loses to it on delta MAE has not solved
+    shape at all, no matter how good its point MAE looks.
+    """
     blob = pickle.load(open(pkl, "rb"))
-    acc: dict[str, list[float]] = {}
+    acc_m: dict[str, list[float]] = {}
+    acc_e: dict[str, list[float]] = {}
     for it in blob["items"]:
-        m = metrics(it["pred"], it["target"])
-        for k, v in m.items():
-            acc.setdefault(k, []).append(v)
-    return {k: float(np.nanmean(v)) for k, v in acc.items()}
+        for k, v in metrics(it["pred"], it["target"]).items():
+            acc_m.setdefault(k, []).append(v)
+        for k, v in metrics(it["exem"], it["target"]).items():
+            acc_e.setdefault(k, []).append(v)
+    return avg(acc_m), avg(acc_e)
 
 
 def main() -> int:
@@ -77,9 +90,9 @@ def main() -> int:
                     help="second pickle to print side by side")
     args = ap.parse_args()
 
-    a = load_metrics(args.pkl)
+    a, a_ex = load_metrics(args.pkl)
     name_a = args.pkl.stem
-    b = load_metrics(args.ref) if args.ref else None
+    b, _ = load_metrics(args.ref) if args.ref else (None, None)
     name_b = args.ref.stem if args.ref else None
 
     keys = ["point", "delta", "shape_corr", "point_const", "point_var",
@@ -96,25 +109,34 @@ def main() -> int:
 
     if b is None:
         print(f"=== shape diagnostic | {name_a} ===")
+        print(f"{'metric':42s}{name_a:>22s}{'exem prior':>22s}")
+        print("-" * 86)
         for k in keys:
-            print(f"  {labels[k]:40s} {a[k]:8.4f}")
+            print(f"{labels[k]:42s}{a[k]:22.4f}{a_ex[k]:22.4f}")
         return 0
 
     print("=== shape diagnostic ===")
-    print(f"{'metric':42s}{name_a:>22s}{name_b:>22s}{'delta':>12s}")
-    print("-" * 98)
+    print(f"{'metric':38s}{name_a:>20s}{name_b:>20s}{'delta':>11s}{'exem':>11s}")
+    print("-" * 100)
     for k in keys:
         d = a[k] - b[k]
-        print(f"{labels[k]:42s}{a[k]:22.4f}{b[k]:22.4f}{d:12.4f}")
-    print("-" * 98)
-    print("delta = A - B. For MAE metrics negative is better;")
-    print("for shape_corr positive is better.")
+        print(f"{labels[k]:38s}{a[k]:20.4f}{b[k]:20.4f}{d:11.4f}{a_ex[k]:11.4f}")
+    print("-" * 100)
+    print("delta = A - B (negative better for MAE, positive better for corr).")
+    print("'exem' column = the exem prior scored in A's own pickle.")
 
-    # how much of the point-MAE win survives once shape is isolated
     if b["point"] > 0 and b["delta"] > 0:
         print()
         print(f"point MAE improvement : {(b['point'] - a['point']) / b['point'] * 100:6.1f}%")
         print(f"delta MAE improvement : {(b['delta'] - a['delta']) / b['delta'] * 100:6.1f}%")
+
+    # The decisive question: does A beat the prior on SHAPE?
+    print()
+    print("vs EXEM PRIOR (shape):")
+    for k, better_low in (("delta", True), ("delta_var", True), ("shape_corr", False)):
+        win = (a[k] < a_ex[k]) if better_low else (a[k] > a_ex[k])
+        print(f"  {labels[k].strip():34s} {a[k]:8.4f} vs {a_ex[k]:8.4f}  "
+              f"{'BEATS prior' if win else 'LOSES to prior'}")
     return 0
 
 

@@ -108,6 +108,14 @@ class PipelineConfig:
     span_w: float = 0.0             # 0 = off (equal weight, legacy)
     span_w_cap: float = 8.0         # clip the relative span ratio before pow
 
+    # V11c: explicit shape (first-difference along T) loss term.
+    # The level term above is dominated by the ~43% of channels that are
+    # constant over time, so shape is never actually optimised: R -> V11a ->
+    # V11b raised abs_mae from +39% to +45% while delta MAE never beat the
+    # exem prior. This adds shape_w * mean((dx_hat - dx)^2), weighted like the
+    # level term. 0 = off (legacy, bit-identical).
+    shape_w: float = 0.0
+
     # ---- honest evaluation (P0) ----
     # Evaluate only on actions shared by >= N models. The deployment task is
     # "known action, new character"; actions unique to one model make the exem
