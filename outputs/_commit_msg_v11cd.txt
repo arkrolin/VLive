@@ -1,0 +1,46 @@
+V11c/V11d shape-loss arms: shape beats exem prior for the first time
+
+Both arms trained to ep70 with zero errors (shape_w=20 on 4 GPUs, shape_w=50 on 3,
+global batch 24 for both, so same-epoch comparisons hold).
+
+Full-614 re-eval (independent per-ckpt dumps, paired test vs V11b):
+  V11b_bank        best ep63 0.8404 (+44.7%)  / latest ep70 0.8311 (+45.3%)
+  V11a_charloo     best ep69 0.8726 (+42.6%)
+  V11c_s20         best ep68 0.9380 (+38.3%)  / latest ep70 0.9312 (+38.7%)
+  R_all_v9+rigloo  best ep68 0.9477 (+37.6%)
+  V11d_s50         best ep68 0.9956 (+34.5%)  / latest ep70 0.9897 (+34.9%)
+Both shape arms are SIGNIFICANTLY WORSE than V11b on abs_mae (t=4.50 / 6.41).
+
+Shape diagnostic (the primary criterion this round) - first time the project
+beats the exem prior on shape on all three metrics:
+  V11b   delta 0.1587 LOSES prior 0.1548 | delta|moving 0.2250 LOSES 0.2235
+  V11c   delta 0.1428 BEATS 0.1548 (-7.7%) | delta|moving 0.2067 BEATS (-7.5%)
+  V11d   delta 0.1422 BEATS 0.1548 (-8.1%) | delta|moving 0.2075 BEATS (-7.2%)
+  shape corr: V11c 0.5843 / V11d 0.5859 vs prior 0.5740
+
+Clean causal chain (same protocol): R -> V11b improves point MAE 10.2% but makes
+delta MAE WORSE by 4.9%, i.e. all of bank's abs_mae gain was amplitude, shape was
+actively degraded. Adding the shape term is the first thing that actually teaches
+shape. Amplitude and shape are near-orthogonal objectives.
+
+Degeneracy ruled out: new outputs/diag_shape_floor.py shows the per-channel-constant
+predictor floor is 0.3212 (moving channels); all arms sit at 0.64-0.70x that floor
+and ||dpred||/||dtarget|| = 0.76-0.85, and shape corr rises - so the delta-MAE win
+is real tracking, not a flattened curve (a mild ~10% flattening does contribute).
+
+lambda margin: 20 -> 50 costs 6.5% more point MAE for only 0.4% more delta MAE
+(0.1428 -> 0.1422). Shape gain saturates on a very shallow plateau => residual shape
+error is structural, not a weighting problem. lambda=20 is the operating point;
+next sweep is 5/10/15, and the shape term should be masked to moving channels only.
+
+Decision: V11b stays the abs_mae baseline; V11c(lam=20) enters as the "shape-first"
+operating point. The acceptance gate must gain a shape criterion - note V11b, the
+current SOTA, FAILS such a criterion, which is itself the finding.
+
+New pitfall found and fixed: eval_ckpt.py --dump names npz files by RUN ONLY, so
+ckpt_best and ckpt_latest of the same run overwrite each other when scored
+concurrently. best/latest must dump to separate directories.
+
+Also: server outputs/gen_render_data.py confirmed to pass
+cstats/bank/bank_mask/bank_act (md5 e836b658); the local mirror was stale and has
+been re-synced.
