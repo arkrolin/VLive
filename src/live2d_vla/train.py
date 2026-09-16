@@ -370,7 +370,24 @@ def noise_loss(model, batch, device, cfg, per_lo, per_hi, g_lo, g_hi, arm_w):
         d_hat = x0_hat[..., 1:] - x0_hat[..., :-1]
         d_tgt = x0[..., 1:] - x0[..., :-1]
         sd = (d_hat - d_tgt) ** 2
-        loss = loss + shape_w * (sd * valid).sum() / valid.sum().clamp(min=1.0)
+        # V11e(c): optionally restrict the shape term to MOVING channels.
+        # A constant-target channel has d_target == 0, so the unmasked term
+        # charges its prediction's jitter -- effectively a "don't wobble where
+        # the truth is flat" regulariser. Masking them out concentrates the
+        # shape gradient on channels that actually move. Note this is a
+        # RE-WEIGHTING, not a saving: the reached loss grows (x1.48) while the
+        # denominator shrinks (x0.568), which scales the effective lambda by
+        # ~x1.76 -> turn this on ONLY together with a rescaled shape_w.
+        # ptp is measured on `target` in RAW units (x0 is already normalised,
+        # so using x0 here would make the threshold span-dependent).
+        mm_thr = float(getattr(cfg, "shape_motion_mask", 0.0))
+        if mm_thr > 0:
+            ptp = target.amax(dim=-1) - target.amin(dim=-1)      # (B,n) raw units
+            m_mov = (ptp > mm_thr).unsqueeze(-1).float()         # (B,n,1)
+            sw = valid * m_mov
+            loss = loss + shape_w * (sd * sw).sum() / sw.sum().clamp(min=1.0)
+        else:
+            loss = loss + shape_w * (sd * valid).sum() / valid.sum().clamp(min=1.0)
     return loss
 
 
@@ -599,6 +616,12 @@ def parse_args():
                         "0 = level only (legacy). The level term is dominated by "
                         "constant/rest channels, so shape never gets optimised "
                         "regardless of abs_mae; this adds mean(dx_hat-dx)^2.")
+    p.add_argument("--shape_motion_mask", type=float, default=None,
+                   help="V11e(c): restrict the shape term to channels whose RAW "
+                        "target ptp exceeds this threshold. NOT a saving: it is a "
+                        "re-weighting (loss x1.48, denominator x0.568 -> effective "
+                        "lambda x1.76), so rescale --shape_w when enabling. "
+                        "0 = off (legacy, bit-identical); 1e-3 = working point.")
     p.add_argument("--n_layers", type=int, default=None, help="DiT depth")
     p.add_argument("--patience", type=int, default=None,
                    help="early-stopping patience (epochs) on val_loss")
@@ -624,6 +647,11 @@ def parse_args():
                         "(per-param gain + low-rank DCT shape correction)")
     p.add_argument("--residual_rank", type=int, default=None,
                    help="V10: r = number of global DCT shape bases (structured head)")
+    p.add_argument("--head_additive_amp", action="store_true", default=None,
+                   help="V11e(b2): add an ADDITIVE per-param amplitude term to the "
+                        "structured head: exem*(1+alpha) + d_amp + coef@basis. The "
+                        "multiplicative gain alone cannot move a ~0 prior or flip a "
+                        "sign; the prior under-shoots in 28.4% of moving channels.")
     # ---- V11a: character conditioning (leave-one-out) --------------------- #
     p.add_argument("--rig_loo", action="store_true", default=None,
                    help="V11a: exclude the TARGET motion from the model's own "
@@ -703,6 +731,8 @@ def main():
         cfg.span_w_cap = args.span_w_cap
     if args.shape_w is not None:
         cfg.shape_w = args.shape_w
+    if args.shape_motion_mask is not None:
+        cfg.shape_motion_mask = args.shape_motion_mask
     if args.n_layers is not None:
         cfg.n_layers = args.n_layers
     if args.patience is not None:
@@ -719,6 +749,8 @@ def main():
         cfg.head_mode = args.head_mode
     if args.residual_rank is not None:
         cfg.residual_rank = args.residual_rank
+    if args.head_additive_amp is not None:
+        cfg.head_additive_amp = bool(args.head_additive_amp)
     if args.rig_loo is not None:
         cfg.rig_loo = bool(args.rig_loo)
     if args.char_stats is not None:
@@ -775,7 +807,10 @@ def main():
               f"n_layers={cfg.n_layers} batch_size={cfg.batch_size} "
               f"patience={cfg.early_stop_patience} "
               f"residual_gate={cfg.residual_gate} select_metric={cfg.select_metric} "
-              f"span_cond={cfg.span_cond} shape_w={cfg.shape_w}")
+              f"span_cond={cfg.span_cond} shape_w={cfg.shape_w} "
+              f"shape_motion_mask={cfg.shape_motion_mask} "
+              f"head_mode={cfg.head_mode} residual_rank={cfg.residual_rank} "
+              f"head_additive_amp={getattr(cfg, 'head_additive_amp', False)}")
         print(f"[rank{rank}] V9 corpus: data_root={cfg.data_root.name} "
               f"whitelist={Path(cfg.whitelist_path).name} "
               f"gen_mask={Path(cfg.gen_mask_path).name} "

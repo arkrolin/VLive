@@ -116,6 +116,29 @@ class PipelineConfig:
     # level term. 0 = off (legacy, bit-identical).
     shape_w: float = 0.0
 
+    # ---- V11e(c): restrict the SHAPE term to moving channels --------------- #
+    # Motivation vs the original §14.6(c) framing: that framing claimed the
+    # shape term "wastes lambda" on the ~43% constant channels. Measured
+    # (diag_channel_mask.py, 614 samples / 37546 slots) that is NOT what
+    # happens. A constant-target channel has d_target == 0, so its TARGET-side
+    # shape energy is exactly 0.0%; what the unmasked term actually charges on
+    # those channels is the PREDICTION's jitter, (d_pred - 0)^2 -- i.e. a
+    # "don't wobble where the truth is flat" regulariser. Removing it makes the
+    # achieved shape loss LARGER (6.6538 -> 9.8489, x1.48) while shrinking the
+    # denominator (1764662 -> 1002839, x0.5683).
+    #
+    # So this is a RE-WEIGHTING (concentrate the shape gradient on channels
+    # that actually move), not a saving -- and it silently scales the effective
+    # lambda by ~x1.76. Any run that turns this on MUST also rescale shape_w
+    # (lambda ~10 rather than 20), otherwise the two effects confound and "no
+    # change" would be misread as "masking is useless".
+    #
+    # The target ptp distribution is strongly bimodal (p25=0, p50=0.20,
+    # p99=44.3), so any threshold in [1e-6, 1e-2] selects the same 56.8% of
+    # slots -> the gate is insensitive to the exact value. 0 = off (legacy,
+    # bit-identical), 1e-3 = the chosen working point.
+    shape_motion_mask: float = 0.0
+
     # ---- honest evaluation (P0) ----
     # Evaluate only on actions shared by >= N models. The deployment task is
     # "known action, new character"; actions unique to one model make the exem
@@ -193,6 +216,21 @@ class PipelineConfig:
     #                 from P*T (~2688) to P*(1+r) (~56*3=168).
     head_mode: str = "dense"         # "dense" | "structured"
     residual_rank: int = 2           # r = number of global shape bases (rank)
+
+    # ---- V11e(b2): additive amplitude term on the structured head ---------- #
+    # The structured head's amplitude is MULTIPLICATIVE: exem * (1 + alpha).
+    # That form cannot move a channel whose prior is ~0, and it cannot flip the
+    # sign of an amplitude error. Measured on moving channels
+    # (diag_channel_mask.py): |exem| < 0.01 in 6.2% of slots and < 0.1 in
+    # 18.2%; the prior undershoots (exem ptp < 0.5 x target ptp) in 28.4%
+    # (median exem ptp 0.66 vs target 0.99). So a purely multiplicative gain is
+    # the wrong form for a large minority of the moving channels -- an ADDITIVE
+    # amplitude correction d_amp in R^P is required, not optional.
+    #
+    # Output becomes: exem * (1 + alpha) + d_amp + coef @ basis
+    # Only meaningful with head_mode="structured". Zero-init, so enabling it
+    # keeps the structured head's init behaviour (x0_hat == exem) bit-identical.
+    head_additive_amp: bool = False
 
     # ---- per-param range statistics (see outputs/_patch_range_fix.py) ----
     # None = scan the whole train corpus (one pass, ~3.5 min, cached to

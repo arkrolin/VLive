@@ -218,10 +218,23 @@ class Live2DModel(nn.Module):
             nn.init.zeros_(self.gain_head.bias)
             nn.init.zeros_(self.coef_head.weight)
             nn.init.zeros_(self.coef_head.bias)
+            # V11e(b2): ADDITIVE amplitude correction in R^P. The multiplicative
+            # gain above cannot move a near-zero prior or fix a sign error; the
+            # prior under-shoots in 28.4% of moving channels, so this term is
+            # required for those. Zero-init -> init stays x0_hat == exem.
+            self.additive_amp = bool(getattr(cfg, "head_additive_amp", False))
+            if self.additive_amp:
+                self.amp_head = nn.Linear(d, 1)
+                nn.init.zeros_(self.amp_head.weight)
+                nn.init.zeros_(self.amp_head.bias)
+            else:
+                self.amp_head = None
             self.head = None
         else:
             self.gain_head = None
             self.coef_head = None
+            self.amp_head = None
+            self.additive_amp = False
             self.head = nn.Linear(d, 1)
             # zero-init head: x0_hat = exem (the prior) at init -> loss starts at floor
             nn.init.zeros_(self.head.weight)
@@ -382,6 +395,11 @@ class Live2DModel(nn.Module):
             coef = self.coef_head(h_pool)           # (B,n,r) per-param basis coeffs
             shape = coef @ self.basis              # (B,n,T) low-rank shape correction
             out = exem * (1.0 + alpha) + shape      # x0_hat = prior * (1+gain) + shape
+            if self.amp_head is not None:
+                # V11e(b2): additive amplitude correction, for the 28.4% of
+                # moving channels where the prior under-shoots (and any sign
+                # error, which the multiplicative form cannot express).
+                out = out + self.amp_head(h_pool)
         else:
             out = self.head(h).squeeze(-1)                               # (B,n,T)
             if self.gate_emb is not None:
