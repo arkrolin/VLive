@@ -64,7 +64,7 @@ for ARM in $ARMS; do
   RUN=abl_V11e_${ARM}
   LOG=outputs/logs/${RUN}.log
 
-  if [ -f "$LOG" ] && grep -q "ep ${EPOCHS}/${EPOCHS}\]" "$LOG"; then
+  if [ -f "$LOG" ] && grep -q "ep ${EPOCHS}/${EPOCHS} step" "$LOG"; then
     say "OK $ARM already reached ${EPOCHS}/${EPOCHS}"
     continue
   fi
@@ -118,7 +118,7 @@ for ARM in $ARMS; do
     [ "$_" -ge 11520 ] && timed_out=1
   done
 
-  if [ -f "$LOG" ] && grep -q "ep ${EPOCHS}/${EPOCHS}\]" "$LOG"; then
+  if [ -f "$LOG" ] && grep -q "ep ${EPOCHS}/${EPOCHS} step" "$LOG"; then
     say "DONE $ARM"
   else
     say "ARM $ARM did NOT reach ${EPOCHS}/${EPOCHS}"

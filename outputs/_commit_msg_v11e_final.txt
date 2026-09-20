@@ -1,0 +1,35 @@
+V11e four-arm final: B1b (structured head, no additive) is the new SOTA 0.7871
+
+Full-614 abs_mae, all four arms at 70/70, n_inst=37546:
+  B1b_latest 0.7860 | B1b_best 0.7871 | D1_latest 0.8037 | D1_best 0.8131
+  B2_best 0.8139 | B2_latest 0.8212 | V11b(prev SOTA) 0.8392 | C1a 0.9225/0.9229
+  V11c 0.9337/0.9381
+
+Shape diagnosis (diag_shape + diag_shape_floor, 614 samples):
+  B1b leads on all four axes: point MAE 0.8177 (lowest), shape corr 0.7124
+  (all-time high; prior best 0.6693), constant-ch 0.5738 (lowest),
+  moving delta MAE 0.2083 (lowest), amplitude retention 91.8% (not flattening).
+
+Verdicts:
+  - B1b vs B2 differ ONLY by --head_additive_amp, so this is a clean single-variable
+    contrast: the additive amplitude term is net-NEGATIVE on all four metrics
+    (abs_mae 0.8139 vs 0.7871, corr 0.6982 vs 0.7124, retention 90.6% vs 91.8%).
+    -> remove head_additive_amp from the mainline.
+  - C1a (motion mask, shape_w=10) FAILS: retention 76.6%, i.e. the flattening trap
+    documented in 15.11.5, and corr 0.5897 is barely above the exem prior (0.5740).
+    Its lowest-in-table delta MAE is bought by shrinking, not by shape ability.
+  - D1 (B2 + C1a) does not beat B1b (corr 0.7026, point MAE 0.8515).
+  - Corrigendum to 15.11.6: B2 did overtake V11b (0.8725 -> 0.8139) as predicted,
+    but B1b is the SOTA, so extrapolating ONE arm's mid-run trajectory to a
+    cross-arm final ranking was the same mistake as 15.10.1 / 15.11.1.
+
+Engineering:
+  - queue_V11e.sh completion test fixed: `grep "ep N/N]"` can never match the real
+    log line `[ep 70/70 step 500/504]`, so every arm was reported as
+    "did NOT reach 70/70" -- a false alarm. Now `grep "ep N/N step"`.
+  - First time the re-eval path (recon_metrics) and the render path
+    (gen_render_data's own forward) agree on RANKING (B1b < D1 < B2 < V11b < C1a).
+
+New scripts: v11e_final_eval.sh (11-ckpt full-614 re-eval), v11e_final_shape.sh
+(phase-2 renders + shape diagnosis), post_B2_ep50.sh (emergency single-card snapshot).
+Report: outputs/V11_角色条件化_诊断与方案.md section 15.12.
