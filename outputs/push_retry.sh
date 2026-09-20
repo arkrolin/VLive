@@ -41,7 +41,7 @@ git remote set-url origin "https://x-access-token:${TOK}@github.com/arkrolin/VLi
 
 RC=1
 for i in 1 2 3 4 5 6; do
-    if git push origin main >> "$LOG" 2>&1; then
+    if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=25 push origin main >> "$LOG" 2>&1; then
         echo "PUSH OK on attempt $i"
         RC=0
         break
